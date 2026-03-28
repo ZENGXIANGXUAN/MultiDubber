@@ -74,7 +74,6 @@ runTTS.bat
 
 ## 注意事项
 
-- `API_CLOSE.py` 文件由于包含敏感密钥信息，已添加到 `.gitignore` 中，不会被提交到版本控制系统
 - 请确保在使用时遵守相应 TTS 服务的使用条款
 - 音频处理功能依赖于外部库，如 `pyrubberband` 等
 
