@@ -1,0 +1,10 @@
+gradio_client
+joblib
+numpy
+pydub
+pyrubberband
+requests
+scikit-learn
+soundfile
+tqdm
+PyQt6
