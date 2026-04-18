@@ -145,9 +145,6 @@ class MultiServerDispatcher:
         self._gpu_worker_threads: List[threading.Thread] = []
         self._cpu_worker_threads: List[threading.Thread] = []
 
-        # 每台服务器独立的下线标记（线程安全通过 _server_lock 保护）
-        # 无需计数器：由任务重试耗尽触发下线
-
         # 活跃服务器集合
         self._active_servers = set(self.server_configs.keys())
         self._server_lock    = threading.Lock()
@@ -194,6 +191,11 @@ class MultiServerDispatcher:
                    post_process_fn: Callable,
                    done_callback: Callable,
                    abort_flag_fn: Callable[[], bool]):
+        # ── 修复竞态：先将 _total_submitted 设为不可能达到的哨兵值，
+        # 防止 CPU Worker 在喂任务期间提前触发 _all_done_event。
+        with self._done_lock:
+            self._total_submitted = float('inf')
+
         submitted = 0
         for task_id, ref_audio_path, gen_text, speed in task_iter:
             if abort_flag_fn() or self._abort_event.is_set():
@@ -203,12 +205,12 @@ class MultiServerDispatcher:
             self._gpu_queue.put(task)
             submitted += 1
 
+        # 所有任务已入队，写入真实数量，并补检"喂完时是否已全部完成"
         with self._done_lock:
             self._total_submitted = submitted
-
-        if submitted == 0:
-            self._all_done_event.set()
-            return
+            if submitted == 0 or self._total_done >= submitted:
+                self._all_done_event.set()
+                return
 
         self._all_done_event.wait()
 
