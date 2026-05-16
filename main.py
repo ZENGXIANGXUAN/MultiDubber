@@ -11,10 +11,11 @@ import subprocess
 
 import config
 from config import (
-    SRT_PATH, REF_AUDIO_PATH, OUTPUT_PATH, TMP_DIR, MAX_SUBTITLE_LENGTH,
-    MODEL_PATH, TRAINING_THRESHOLD, MIN_SPEED, MAX_SPEED, STATUS_FILE,
+    SRT_PATH, REF_AUDIO_PATH, OUTPUT_PATH,
+    MODEL_PATH, TRAINING_THRESHOLD, MIN_SPEED, MAX_SPEED,
     TRANSFORMERS_LINE, USE_TQDM_PROGRESS_BAR, model_lock, status_lock
 )
+from logger import log as logger_log
 from utils import load_status, save_status, clear_status, time_str_to_seconds
 from subtitle_parser import parse_subtitles, merge_consecutive_subtitles
 from audio_processor import (
@@ -52,17 +53,11 @@ def preprocess_text(text: str) -> str:
 
 
 def post_process_audio_task(index: int, raw_generated_path: str, applied_speed: float, text: str,
-                            target_duration_s: float, current_tmp_dir: str, callback=None):
+                            target_duration_s: float, current_tmp_dir: str):
     output_path_for_merge = os.path.join(current_tmp_dir, f"output_{index}.wav")
 
-    def log(msg):
-        if callback:
-            callback.log(msg)
-        elif not USE_TQDM_PROGRESS_BAR:
-            print(msg)
-
     if not raw_generated_path or not os.path.exists(raw_generated_path):
-        log(f"  !! [Task {index}] API生成失败，创建静音占位符。")
+        logger_log("POST", f"!! [Task {index}] API生成失败，创建静音占位符。")
         AudioSegment.silent(duration=target_duration_s * 1000).export(output_path_for_merge, format="wav")
         return index
     try:
@@ -71,7 +66,7 @@ def post_process_audio_task(index: int, raw_generated_path: str, applied_speed: 
             audio = AudioSegment.from_file(raw_generated_path)
             actual_raw_duration_s = (len(audio) / 1000.0) * applied_speed
         except Exception as e:
-            log(f"!! [Task {index}] 无法获取生成音频的时长: {e}")
+            logger_log("POST", f"!! [Task {index}] 无法获取生成音频的时长: {e}")
         adjust_duration_with_rubberband(raw_generated_path, output_path_for_merge, target_duration_s)
         try:
             os.remove(raw_generated_path)
@@ -82,18 +77,16 @@ def post_process_audio_task(index: int, raw_generated_path: str, applied_speed: 
                 duration_predictor.add_data_point_and_retrain(text, actual_raw_duration_s)
         return index
     except Exception as e:
-        log(f"!! [Task {index}] Post-processing 发生严重错误: {e}")
+        logger_log("POST", f"!! [Task {index}] Post-processing 发生严重错误: {e}")
         return index
 
 
-def tts_generation_task(index: int, subtitle: List, main_reference_audio: str, current_tmp_dir: str, callback=None):
-    """单服务器模式用（兼容保留）"""
+def tts_generation_task(index: int, subtitle: List, main_reference_audio: str, current_tmp_dir: str):
     start_time, end_time, raw_text, _ = subtitle
     text = preprocess_text(raw_text)
     if not text: return None, 0, text, 0
     reference_clip = crop_audio(start_time, end_time, main_reference_audio)
 
-    # 【修复单服务器崩溃】如果音频极短，强制跳过避免崩溃
     if not reference_clip or len(reference_clip) < 500:
         return None, 0, text, 0
 
@@ -145,10 +138,10 @@ def _prepare_tts_params(index: int, subtitle: List, main_reference_audio: str,
         # 当前音频太短/有毒，触发回退机制：使用上一次的健康音频
         if last_valid_ref_path and os.path.exists(last_valid_ref_path):
             current_len = len(reference_clip) if reference_clip else 0
-            print(f"  -> ⚠️ [Task {index}] 参考音频过短 ({current_len}ms)，自动复用上一句的健康音频！")
+            logger_log("WARN", f"[Task {index}] 参考音频过短 ({current_len}ms)，自动复用上一句的健康音频！")
             ref_clip_path = last_valid_ref_path
         else:
-            print(f"  -> ⚠️ [Task {index}] 参考音频过短，且无历史音频可复用，强制跳过。")
+            logger_log("WARN", f"[Task {index}] 参考音频过短，且无历史音频可复用，强制跳过。")
             return None
 
     # 4. 计算语速
@@ -164,6 +157,90 @@ def _prepare_tts_params(index: int, subtitle: List, main_reference_audio: str,
     }
 
 
+def _find_video_path(base_name_no_ext, srt_path):
+    """在 srt_path 下查找匹配的视频文件。"""
+    video_extensions = {".mp4", ".ts", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm"}
+    for ext in video_extensions:
+        potential_path = os.path.join(srt_path, f"{base_name_no_ext}{ext}")
+        if os.path.exists(potential_path):
+            return potential_path
+    return None
+
+
+def _find_and_merge_video(base_name_no_ext, audio_path, output_folder_zh, srt_path, log):
+    """查找源视频并与配音 WAV 合并，输出到中配文件夹。"""
+    target_video_output = os.path.join(output_folder_zh, f"{base_name_no_ext}.mp4")
+    if os.path.exists(target_video_output):
+        log(f"  -> 最终视频已存在: {os.path.basename(target_video_output)}，无需重复合并。")
+        return
+
+    found_video_path = _find_video_path(base_name_no_ext, srt_path)
+    if found_video_path:
+        log("--- 准备合并音视频 ---")
+        try:
+            if merge_single_audio_video(found_video_path, audio_path, target_video_output):
+                log(f"视频合并成功: {os.path.basename(target_video_output)}")
+            else:
+                log(f"!! 视频合并失败，请检查上方 ffmpeg 错误信息。")
+        except Exception as e:
+            log(f"!! 合并失败: {e}")
+    else:
+        log(f"!! 警告: 未能为 '{base_name_no_ext}' 找到匹配的视频文件，跳过合并。")
+
+
+def _check_task_skip_or_recover(subtitle_name, output_folder_zh, output_audio_file,
+                                 srt_path, log):
+    """
+    判断任务完成状态，返回 "skip" 或 "process"。
+
+    三级判断：
+      1. 中配文件夹下已有视频 → 任务完成，返回 "skip"
+      2. 无视频但已有合并好的 WAV（且 WAV 健康）→ 合成视频，返回 "skip"
+      3. 无视频也无 WAV → 返回 "process"，开始完整流程
+    """
+    target_video_output = os.path.join(output_folder_zh, f"{subtitle_name}.mp4")
+
+    # ── 第 1 级：视频已存在 ──
+    if os.path.exists(target_video_output):
+        log(f"  -> [完成] 最终视频已存在: {os.path.basename(target_video_output)}，跳过。")
+        return "skip"
+
+    # ── 第 2 级：WAV 存在 → 恢复合并 ──
+    if os.path.exists(output_audio_file):
+        wav_size = os.path.getsize(output_audio_file)
+        if wav_size < 1000:
+            log(f"  !! [恢复] WAV 文件异常 ({wav_size} bytes)，视为无效，重新生成。")
+            return "process"
+
+        # 额外验证：确保 WAV 可被 pydub 读取
+        try:
+            test_audio = AudioSegment.from_file(output_audio_file)
+            if len(test_audio) < 100:  # < 0.1 秒，视为无效占位
+                log(f"  !! [恢复] WAV 时长异常 ({len(test_audio)}ms)，重新生成。")
+                return "process"
+        except Exception:
+            log(f"  !! [恢复] WAV 文件损坏无法读取，重新生成。")
+            return "process"
+
+        log(f"  -> [恢复] 已找到配音 WAV ({wav_size / 1024:.0f} KB)，跳过生成，直接合成视频...")
+        _find_and_merge_video(subtitle_name, output_audio_file, output_folder_zh, srt_path, log)
+
+        # 清理可能残留的参考音频（来自上一次未完成运行）
+        ref_audio_dir = os.path.join(srt_path, "REF_AUDIO_PATH")
+        stale_ref = os.path.join(ref_audio_dir, f"{subtitle_name}.wav")
+        if os.path.exists(stale_ref):
+            try:
+                os.remove(stale_ref)
+            except OSError:
+                pass
+
+        return "skip"
+
+    # ── 第 3 级：无视频无 WAV，开始全新流程 ──
+    log(f"  -> [新建] 未检测到任何产物，开始完整流程。")
+    return "process"
+
+
 def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
                       max_workers: int = 2,
                       output_path: str = None, ref_audio_path: str = None,
@@ -177,10 +254,7 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
     """
 
     def log(msg):
-        if progress_callback:
-            progress_callback.log(msg)
-        else:
-            print(msg)
+        logger_log("MAIN", msg)
 
     # ── 路径规范化（修复 Windows 混合斜杠 + 长路径问题）──
     srt_path = os.path.normpath(srt_path)
@@ -219,48 +293,21 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
 
     try:
         srt_files_to_process = sorted(srt_files_to_process, key=lambda x: int(re.findall(r'\d+', x)[0]))
-    except:
+    except (IndexError, ValueError):
         srt_files_to_process.sort()
 
-    # 修复前（第 225 行）
-    total_files = len(srt_files_to_process)
-
-    # 修复后：先预算去重后的真实文件数
+    # Dedup by base name while preserving order
     seen = set()
     unique_files = []
     for f in srt_files_to_process:
-        base, _ = os.path.splitext(f)
+        base = os.path.splitext(f)[0]
         if base not in seen:
             seen.add(base)
             unique_files.append(f)
-    srt_files_to_process = unique_files  # 直接用去重后的列表，后面循环也不会重复
-    total_files = len(srt_files_to_process)  # 现在这个数才是真实值
+    srt_files_to_process = unique_files
+    total_files = len(srt_files_to_process)
     if progress_callback:
         progress_callback.set_total_files(total_files)
-
-    def _find_video_path(base_name_no_ext):
-        video_extensions = {".mp4", ".ts", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".webm"}
-        for ext in video_extensions:
-            potential_path = os.path.join(srt_path, f"{base_name_no_ext}{ext}")
-            if os.path.exists(potential_path):
-                return potential_path
-        return None
-
-    def _find_and_merge_video(base_name_no_ext, audio_path):
-        target_video_output = os.path.join(output_folder_zh, f"{base_name_no_ext}.mp4")
-        if os.path.exists(target_video_output):
-            log(f"  -> 最终视频已存在: {os.path.basename(target_video_output)}，无需重复合并。")
-            return
-        found_video_path = _find_video_path(base_name_no_ext)
-        if found_video_path:
-            log(f"--- 准备合并音视频 ---")
-            try:
-                if merge_single_audio_video(found_video_path, audio_path, target_video_output):
-                    log(f"视频合并成功: {os.path.basename(target_video_output)}")
-            except Exception as e:
-                log(f"!! 合并失败: {e}")
-        else:
-            log(f"!! 警告: 未能为 '{base_name_no_ext}' 找到匹配的视频文件，跳过合并。")
 
     processed_basenames = set()
 
@@ -276,25 +323,18 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
 
         if progress_callback:
             progress_callback.update_file_progress(i)
-            progress_callback.log(f"\n[{i + 1}/{total_files}] === 检查文件 {srt_file} ===")
-        else:
-            print(f"\n[{i + 1}/{total_files}] === 检查文件 {srt_file} ===")
+        log(f"\n[{i + 1}/{total_files}] === 检查文件 {srt_file} ===")
 
         output_audio_file = os.path.join(output_path, f"{subtitle_name}.wav")
 
-        # 最终中配视频已存在 → 彻底完成，直接跳过
-        target_video_output = os.path.join(output_folder_zh, f"{subtitle_name}.mp4")
-        if os.path.exists(target_video_output):
-            log(f"  -> 最终视频已存在，跳过。")
-            continue
-
-        if os.path.exists(output_audio_file):
-            log(f"文件 {output_audio_file} 已存在，跳过生成。")
-            _find_and_merge_video(subtitle_name, output_audio_file)
+        skip_result = _check_task_skip_or_recover(
+            subtitle_name, output_folder_zh, output_audio_file, srt_path, log
+        )
+        if skip_result == "skip":
             continue
 
         main_audio_path = os.path.join(ref_audio_path, subtitle_name + ".wav")
-        found_video_path = _find_video_path(subtitle_name)
+        found_video_path = _find_video_path(subtitle_name, srt_path)
         audio_extracted_in_this_run = False
 
         if not os.path.exists(main_audio_path):
@@ -400,7 +440,7 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
                         idx, raw_path,
                         params["speed"], params["text"],
                         params["target_duration_s"],
-                        current_tmp_dir, progress_callback
+                        current_tmp_dir
                     )
                     with status_lock:
                         completed_indices.add(idx)
@@ -425,12 +465,8 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
                         server_tag = f"{_p.hostname}:{_p.port}" if _p.port else _p.hostname
                         if progress_callback:
                             progress_callback.update_task_progress(completed_count)
-                            progress_callback.log(
-                                f"  -> Task {idx} 完成 ({completed_count}/{total_tasks}) "
-                                f"[{speed_str}] [{server_tag}]"
-                            )
-                        else:
-                            print(f"  -> Task {idx} 完成. [{speed_str}] [{server_tag}]")
+                        log(f"  -> Task {idx} 完成 ({completed_count}/{total_tasks}) "
+                            f"[{speed_str}] [{server_tag}]")
 
                 # ── 任务迭代器：边裁剪参考音频边喂给调度器 ──
                 # 记录最后一次成功健康的音频，用于异常/超短音频的容错替代
@@ -494,15 +530,14 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
                         if config.ABORT_ALL: break
                         subtitle = merged_subtitles[index]
                         gen_future = executor.submit(tts_generation_task, index, subtitle,
-                                                     main_audio_path, current_tmp_dir, progress_callback)
+                                                     main_audio_path, current_tmp_dir)
 
                         def process_when_done(fut, idx=index, pbar_instance=pbar):
                             nonlocal completed_count, session_processed_count
                             if config.ABORT_ALL: return
                             try:
                                 gen_result = fut.result()
-                                post_result = post_process_audio_task(idx, *gen_result, current_tmp_dir,
-                                                                      progress_callback)
+                                post_result = post_process_audio_task(idx, *gen_result, current_tmp_dir)
                                 with status_lock:
                                     completed_indices.add(post_result)
                                     save_status(local_status_file, srt_file, completed_indices)
@@ -517,12 +552,9 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
                                         speed_str = "Calc..."
                                     if progress_callback:
                                         progress_callback.update_task_progress(completed_count)
-                                        progress_callback.log(
-                                            f"  -> Task {idx} 完成 ({completed_count}/{total_tasks}) [{speed_str}]")
                                     elif pbar_instance:
                                         pbar_instance.update(1)
-                                    else:
-                                        print(f"  -> Task {post_result} 完成.")
+                                    log(f"  -> Task {idx} 完成 ({completed_count}/{total_tasks}) [{speed_str}]")
                             except Exception as e:
                                 log(f"!! [Task {idx}] 错误: {e}")
 
@@ -543,27 +575,20 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
             if os.path.exists(current_tmp_dir):
                 shutil.rmtree(current_tmp_dir)
             duration_predictor.train()
-            _find_and_merge_video(subtitle_name, output_audio_file)
+            _find_and_merge_video(subtitle_name, output_audio_file, output_folder_zh, srt_path, log)
         except Exception as e:
             log(f"!! 合并错误: {e}")
         finally:
             if os.path.exists(main_audio_path):
                 try:
                     os.remove(main_audio_path)
-                except:
+                except OSError:
                     pass
 
     if progress_callback:
         progress_callback.update_file_progress(total_files)
-        msg = "\n=== 任务已强制停止 ===" if config.ABORT_ALL else "\n=== 所有任务处理完毕 ==="
-        progress_callback.log(msg)
-
-    try:
-        if os.name == 'nt':
-            subprocess.run('del /q /f /s %TEMP%\\*', shell=True,
-                           creationflags=subprocess.CREATE_NO_WINDOW)
-    except:
-        pass
+    msg = "\n=== 任务已强制停止 ===" if config.ABORT_ALL else "\n=== 所有任务处理完毕 ==="
+    log(msg)
 
     if os.path.exists(ref_audio_path) and not os.listdir(ref_audio_path):
         try:
