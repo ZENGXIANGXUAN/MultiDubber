@@ -297,10 +297,10 @@ class CheckConnectionThread(QThread):
 class WorkerThread(QThread):
     finished_signal = pyqtSignal(bool)
 
-    def __init__(self, srt_path, transformers_line, adapter, server_configs: dict,
+    def __init__(self, srt_paths, transformers_line, adapter, server_configs: dict,
                  max_retries: int = 3):
         super().__init__()
-        self.srt_path = srt_path
+        self.srt_paths = srt_paths
         self.transformers_line = transformers_line
         self.adapter = adapter
         self.server_configs = server_configs
@@ -311,7 +311,7 @@ class WorkerThread(QThread):
         config.ABORT_ALL = False
         try:
             process_srt_files(
-                srt_path=self.srt_path,
+                srt_paths=self.srt_paths,
                 transformers_line=self.transformers_line,
                 progress_callback=self.adapter,
                 server_configs=self.server_configs,
@@ -919,7 +919,7 @@ class TTSApp(QWidget):
     def add_folder(self):
         folder = QFileDialog.getExistingDirectory(
             self, "Select Directory",
-            self.srt_paths[-1] if self.srt_paths else os.path.expanduser("~")
+            list(self._folder_widgets.keys())[-1] if self._folder_widgets else os.path.expanduser("~")
         )
         if not folder:
             return
@@ -938,9 +938,14 @@ class TTSApp(QWidget):
             self.append_log("Error: No online servers available.")
             return
 
+        srt_paths = list(self._folder_widgets.keys())
+        if not srt_paths:
+            self.append_log("Error: No folders added.")
+            return
+
         self.run_btn.setEnabled(False)
         self.run_btn.setText("PROCESSING...")
-        self.path_btn.setEnabled(False)
+        self.add_folder_btn.setEnabled(False)
         self.add_btn.setEnabled(False)
         self.settings_btn.setEnabled(False)
         self.log_output.clear()
@@ -948,12 +953,14 @@ class TTSApp(QWidget):
         self.bar_task_progress.setValue(0)
         self.lbl_task_progress.setText("Current File Tasks: Initializing...")
 
-        self.append_log(f"> 使用 {len(server_configs)} 台服务器（单队列竞争）")
+        self.append_log(f"> 共 {len(srt_paths)} 个文件夹，使用 {len(server_configs)} 台服务器")
+        for p in srt_paths:
+            self.append_log(f"  · {p}")
         for u, n in server_configs.items():
             self.append_log(f"  · {u}  线程数: {n}")
 
         self.worker = WorkerThread(
-            srt_path=self.current_srt_path,
+            srt_paths=srt_paths,
             transformers_line=line_idx,
             adapter=self.adapter,
             server_configs=server_configs,
@@ -992,7 +999,7 @@ class TTSApp(QWidget):
     def process_finished(self, completed: bool):
         self.run_btn.setEnabled(True)
         self.run_btn.setText("START DUBBING")
-        self.path_btn.setEnabled(True)
+        self.add_folder_btn.setEnabled(True)
         self.add_btn.setEnabled(True)
         self.settings_btn.setEnabled(True)
         self.lbl_task_progress.setText("Status: Idle")
@@ -1033,7 +1040,9 @@ class TTSApp(QWidget):
 
         # Webhook 完成通知
         webhook = self._settings.get("webhook_url", "")
-        send_webhook(webhook, msg, f"{detail}\n路径: {self.current_srt_path}")
+        srt_paths = list(self._folder_widgets.keys())
+        path_str = ", ".join(srt_paths) if srt_paths else "无"
+        send_webhook(webhook, msg, f"{detail}\n路径: {path_str}")
         try:
             self._tray.messageClicked.disconnect()
         except TypeError:
