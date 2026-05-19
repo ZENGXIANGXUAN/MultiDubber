@@ -14,19 +14,26 @@ from PyQt6.QtGui import QPalette, QColor, QIcon, QPixmap, QPainter, QBrush, QCur
 import config
 from main import process_srt_files
 from api_client import test_connection
+from logger import init_logger, set_gui_callback, log as file_log, get_log_path
 
-
+try:
+    from API_CLOSE import api_close
+except ImportError:
+    api_close = None
 
 # ── 本地设置持久化 ──────────────────────────────────────────
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_settings.json")
 
 DEFAULT_SETTINGS = {
-    "srt_path": "",
+    "srt_paths": [],
     "line_index": 2,
     "total_threads": 6,
     "max_retries": 3,
     "webhook_url": "https://sctapi.ftqq.com/SCT124090TODYAymp8nuHDeqleLu8oRDAS.send",
     "servers": [],
+    "api_public_key": "",  # 新增：公钥
+    "api_private_key": "",  # 新增：私钥
+    "api_hostid": ""  # 新增：Host ID
 }
 
 
@@ -37,6 +44,9 @@ def load_settings() -> dict:
             # 补全缺失的键
             for k, v in DEFAULT_SETTINGS.items():
                 data.setdefault(k, v)
+            # migrate old single-path setting
+            if not data.get("srt_paths") and data.get("srt_path"):
+                data["srt_paths"] = [data["srt_path"]]
             return data
     except Exception:
         return dict(DEFAULT_SETTINGS)
@@ -47,7 +57,7 @@ def save_settings(data: dict):
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[Settings] 保存失败: {e}")
+        file_log("SETTINGS", f"保存失败: {e}")
 
 
 # ── Webhook 通知 ────────────────────────────────────────────
@@ -63,9 +73,9 @@ def send_webhook(webhook_url: str, title: str, content: str):
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 body = resp.read().decode("utf-8", errors="ignore")
-                print(f"[Webhook] 发送成功: {resp.status}  {body[:80]}")
+                file_log("WEBHOOK", f"发送成功: {resp.status}  {body[:80]}")
         except Exception as e:
-            print(f"[Webhook] 发送失败: {e}")
+            file_log("WEBHOOK", f"发送失败: {e}")
 
     threading.Thread(target=_send, daemon=True).start()
 
@@ -105,7 +115,10 @@ class SettingsDialog(QDialog):
                  line_index: int = 2,
                  total_threads: int = 6,
                  max_retries: int = 3,
-                 webhook_url: str = ""):
+                 webhook_url: str = "",
+                 api_public_key: str = "",
+                 api_private_key: str = "",
+                 api_hostid: str = ""):
         super().__init__(parent)
         self.setWindowTitle("⚙️  Settings")
         self.setMinimumWidth(500)
@@ -152,6 +165,23 @@ class SettingsDialog(QDialog):
         self.webhook_input.setPlaceholderText("https://sctapi.ftqq.com/YOUR_KEY.send")
         self.webhook_input.setToolTip("Server 酱 Webhook，服务器熔断或任务完成时发送通知")
         form.addRow("Webhook URL:", self.webhook_input)
+
+        # ----- 云主机 API 关机设置 -----
+        self.pub_key_input = QLineEdit(api_public_key)
+        self.pub_key_input.setMinimumHeight(32)
+        self.pub_key_input.setPlaceholderText("在此输入公钥 (留空则不调用关机)")
+        form.addRow("API 公钥:", self.pub_key_input)
+
+        self.priv_key_input = QLineEdit(api_private_key)
+        self.priv_key_input.setMinimumHeight(32)
+        self.priv_key_input.setPlaceholderText("在此输入私钥")
+        form.addRow("API 私钥:", self.priv_key_input)
+
+        self.hostid_input = QLineEdit(api_hostid)
+        self.hostid_input.setMinimumHeight(32)
+        self.hostid_input.setPlaceholderText("例如: uhost-1ojkz7p7vyrn")
+        form.addRow("API Host ID:", self.hostid_input)
+        # ---------------------------------
 
         layout.addLayout(form)
 
@@ -204,25 +234,43 @@ class SettingsDialog(QDialog):
     def webhook_url(self) -> str:
         return self.webhook_input.text().strip()
 
+    @property
+    def api_public_key(self) -> str:
+        return self.pub_key_input.text().strip()
+
+    @property
+    def api_private_key(self) -> str:
+        return self.priv_key_input.text().strip()
+
+    @property
+    def api_hostid(self) -> str:
+        return self.hostid_input.text().strip()
+
 
 # ══════════════════════════════════════════════════════════════
 # 信号桥接
 # ══════════════════════════════════════════════════════════════
 class GuiProgressAdapter(QObject):
-    log_signal          = pyqtSignal(str)
-    total_files_signal  = pyqtSignal(int)
+    log_signal = pyqtSignal(str)
+    total_files_signal = pyqtSignal(int)
     current_file_signal = pyqtSignal(int)
-    total_tasks_signal  = pyqtSignal(int)
+    total_tasks_signal = pyqtSignal(int)
     current_task_signal = pyqtSignal(int)
-    server_down_signal  = pyqtSignal(str, str)   # url, stats
-    all_down_signal     = pyqtSignal()
+    server_down_signal = pyqtSignal(str, str)  # url, stats
+    all_down_signal = pyqtSignal()
 
     def log(self, message: str):               self.log_signal.emit(message)
+
     def set_total_files(self, total: int):     self.total_files_signal.emit(total)
+
     def update_file_progress(self, current):   self.current_file_signal.emit(current)
+
     def set_current_task_range(self, total):   self.total_tasks_signal.emit(total)
+
     def update_task_progress(self, current):   self.current_task_signal.emit(current)
+
     def notify_server_down(self, url, stats):  self.server_down_signal.emit(url, stats)
+
     def notify_all_down(self):                 self.all_down_signal.emit()
 
 
@@ -282,12 +330,13 @@ class WorkerThread(QThread):
 # ══════════════════════════════════════════════════════════════
 class ServerEntryWidget(QWidget):
     remove_signal = pyqtSignal(QListWidgetItem)
-    retry_signal  = pyqtSignal(str)
+    retry_signal = pyqtSignal(str)
 
     def __init__(self, url: str, parent_item: QListWidgetItem, parent=None):
         super().__init__(parent)
         self.url = url
         self.parent_item = parent_item
+        self._status = 'checking'
 
         layout = QHBoxLayout()
         layout.setContentsMargins(4, 2, 4, 2)
@@ -319,7 +368,12 @@ class ServerEntryWidget(QWidget):
         layout.addWidget(self.remove_btn)
         self.setLayout(layout)
 
+    @property
+    def status(self) -> str:
+        return self._status
+
     def set_status(self, status: str):
+        self._status = status
         colors = {'checking': "#f1c40f", 'online': "#2ecc71", 'offline': "#e74c3c"}
         self.led.setStyleSheet(
             f"background-color: {colors.get(status, '#666')}; border-radius: 6px;"
@@ -344,10 +398,15 @@ class TTSApp(QWidget):
 
         # 加载本地设置
         self._settings = load_settings()
-        self.current_srt_path = self._settings.get("srt_path", "")
+        self.srt_paths: list = self._settings.get("srt_paths", [])
 
         self.initUI()
         self.apply_styles()
+
+        # 初始化日志文件系统（在 initUI 之后，确保 adapter 已创建）
+        log_path = init_logger()
+        set_gui_callback(self._on_log_line)
+        self.append_log(f"> 日志文件: {log_path}")
 
         # 恢复上次的服务器列表
         for url in self._settings.get("servers", []):
@@ -424,9 +483,9 @@ class TTSApp(QWidget):
 
         # 只读摘要行（Line Index & 总线程数，点 Settings 才能改）
         summary_layout = QHBoxLayout()
-        self.lbl_line_summary    = QLabel(f"Line Index: {self._settings['line_index']}")
-        self.lbl_thread_summary  = QLabel(f"总线程数: {self._settings['total_threads']}")
-        self.lbl_retry_summary   = QLabel(f"最大重试: {self._settings.get('max_retries', 3)}")
+        self.lbl_line_summary = QLabel(f"Line Index: {self._settings['line_index']}")
+        self.lbl_thread_summary = QLabel(f"总线程数: {self._settings['total_threads']}")
+        self.lbl_retry_summary = QLabel(f"最大重试: {self._settings.get('max_retries', 3)}")
         self.lbl_webhook_summary = QLabel()
         self._refresh_summary_labels()
 
@@ -550,14 +609,23 @@ class TTSApp(QWidget):
             total_threads=self._settings["total_threads"],
             max_retries=self._settings.get("max_retries", 3),
             webhook_url=self._settings.get("webhook_url", ""),
+            api_public_key=self._settings.get("api_public_key", ""),
+            api_private_key=self._settings.get("api_private_key", ""),
+            api_hostid=self._settings.get("api_hostid", "")
         )
         # 应用暗色样式到对话框
         dlg.setStyleSheet(self.styleSheet())
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._settings["line_index"]    = dlg.line_index
+            self._settings["line_index"] = dlg.line_index
             self._settings["total_threads"] = dlg.total_threads
-            self._settings["max_retries"]   = dlg.max_retries
-            self._settings["webhook_url"]   = dlg.webhook_url
+            self._settings["max_retries"] = dlg.max_retries
+            self._settings["webhook_url"] = dlg.webhook_url
+
+            # 接收新参数并保存
+            self._settings["api_public_key"] = dlg.api_public_key
+            self._settings["api_private_key"] = dlg.api_private_key
+            self._settings["api_hostid"] = dlg.api_hostid
+
             self._save_current_settings()
             self._refresh_summary_labels()
             self._update_thread_hints()
@@ -583,7 +651,7 @@ class TTSApp(QWidget):
     # ── 持久化 ──────────────────────────────────
     def _save_current_settings(self):
         self._settings["srt_path"] = self.current_srt_path
-        self._settings["servers"]  = list(self._server_widgets.keys())
+        self._settings["servers"] = list(self._server_widgets.keys())
         save_settings(self._settings)
 
     # ── 服务器管理 ────────────────────────────────
@@ -618,7 +686,7 @@ class TTSApp(QWidget):
         except (KeyError, TypeError):
             return
         online = [(url, entry) for url, (_, entry) in self._server_widgets.items()
-                  if "#e74c3c" not in entry.led.styleSheet()]
+                  if entry.status != 'offline']
         n = len(online)
         if n == 0:
             return
@@ -627,13 +695,13 @@ class TTSApp(QWidget):
         for i, (url, entry) in enumerate(online):
             entry.set_thread_hint(max(1, base + (remainder if i == 0 else 0)))
         for url, (_, entry) in self._server_widgets.items():
-            if "#e74c3c" in entry.led.styleSheet():
+            if entry.status == 'offline':
                 entry.set_thread_hint(0)
 
     def _get_server_configs(self) -> dict:
         total = max(1, self._settings.get("total_threads", 6))
         online = [(url, entry) for url, (_, entry) in self._server_widgets.items()
-                  if "#e74c3c" not in entry.led.styleSheet()]
+                  if entry.status != 'offline']
         n = len(online)
         if n == 0:
             return {}
@@ -678,7 +746,7 @@ class TTSApp(QWidget):
             return [url]
 
         extra = int(m.group(1))
-        base  = raw[:m.start()] + raw[m.end():]   # 去掉 ~N 部分
+        base = raw[:m.start()] + raw[m.end():]  # 去掉 ~N 部分
         if not base.endswith('/'):
             base += '/'
 
@@ -689,8 +757,8 @@ class TTSApp(QWidget):
             return [base]
 
         base_port = int(port_m.group(1))
-        prefix    = base[:port_m.start(1)]   # "http://127.0.0.1:"
-        suffix    = base[port_m.end(1):]     # "/"
+        prefix = base[:port_m.start(1)]  # "http://127.0.0.1:"
+        suffix = base[port_m.end(1):]  # "/"
 
         urls = []
         for i in range(extra + 1):
@@ -824,12 +892,11 @@ class TTSApp(QWidget):
         self.worker.start()
 
     def append_log(self, text):
-        cursor = self.log_output.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.log_output.setTextCursor(cursor)
-        self.log_output.insertPlainText(text + "\n")
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.log_output.setTextCursor(cursor)
+        self.log_output.append(text)
+
+    def _on_log_line(self, line: str):
+        """日志回调（来自任意线程），通过 Qt 信号安全地投递到 GUI 线程。"""
+        self.adapter.log_signal.emit(line)
 
     def init_total_bar(self, total):
         self.bar_total_progress.setMaximum(total)
@@ -860,31 +927,45 @@ class TTSApp(QWidget):
         self.lbl_task_progress.setText("Status: Idle")
 
         if completed:
-            msg    = "✅ 所有配音任务已完成！"
+            msg = "✅ 所有配音任务已完成！"
             detail = "全部文件处理完毕，可以查看输出目录。"
-            icon   = QSystemTrayIcon.MessageIcon.Information
+            icon = QSystemTrayIcon.MessageIcon.Information
             tray_icon = _make_icon("#2ecc71")
-            log_msg   = "\n>>> ✅ All tasks completed."
-            sound     = "finish"
+            log_msg = "\n>>> ✅ All tasks completed."
+            sound = "finish"
         else:
-            msg    = "⚠️ 任务已中止"
+            msg = "⚠️ 任务已中止"
             detail = "配音流程被停止，已完成部分已保存。"
-            icon   = QSystemTrayIcon.MessageIcon.Warning
+            icon = QSystemTrayIcon.MessageIcon.Warning
             tray_icon = _make_icon("#e67e22")
-            log_msg   = "\n>>> ⚠️ Workflow aborted."
-            sound     = "abort"
+            log_msg = "\n>>> ⚠️ Workflow aborted."
+            sound = "abort"
 
         self.append_log(log_msg)
         _play_sound(sound)
         self._tray.setIcon(tray_icon)
         self._tray.showMessage("Auto Dubbing Studio", f"{msg}\n{detail}", icon, 6000)
 
+        # ── 新的动态关闭逻辑 ─────────────────────────────────────
+        pub_key = self._settings.get("api_public_key", "")
+        priv_key = self._settings.get("api_private_key", "")
+        host_id = self._settings.get("api_hostid", "")
+
+        # 只有当 api_close 函数存在，且用户输入了这三个值时，才触发关机
+        if api_close and pub_key and priv_key and host_id:
+            try:
+                self.append_log(f"\n>>> 🔌 正在调用 API 关闭云主机 ({host_id})...")
+                api_close(pub_key, priv_key, host_id)
+            except Exception as e:
+                self.append_log(f"\n>>> ⚠️ 调用 api_close 失败: {e}")
+        # ───────────────────────────────────────────────────────
+
         # Webhook 完成通知
         webhook = self._settings.get("webhook_url", "")
         send_webhook(webhook, msg, f"{detail}\n路径: {self.current_srt_path}")
         try:
             self._tray.messageClicked.disconnect()
-        except Exception:
+        except TypeError:
             pass
         self._tray.messageClicked.connect(self._bring_to_front)
         QTimer.singleShot(5000, lambda: self._tray.setIcon(_make_icon("#3498db")))
@@ -892,18 +973,18 @@ class TTSApp(QWidget):
     def apply_styles(self):
         QApplication.setStyle(QStyleFactory.create('Fusion'))
         dark_palette = QPalette()
-        dark_palette.setColor(QPalette.ColorRole.Window,          QColor(45, 45, 45))
-        dark_palette.setColor(QPalette.ColorRole.WindowText,      Qt.GlobalColor.white)
-        dark_palette.setColor(QPalette.ColorRole.Base,            QColor(30, 30, 30))
-        dark_palette.setColor(QPalette.ColorRole.AlternateBase,   QColor(53, 53, 53))
-        dark_palette.setColor(QPalette.ColorRole.ToolTipBase,     Qt.GlobalColor.white)
-        dark_palette.setColor(QPalette.ColorRole.ToolTipText,     Qt.GlobalColor.white)
-        dark_palette.setColor(QPalette.ColorRole.Text,            Qt.GlobalColor.white)
-        dark_palette.setColor(QPalette.ColorRole.Button,          QColor(53, 53, 53))
-        dark_palette.setColor(QPalette.ColorRole.ButtonText,      Qt.GlobalColor.white)
-        dark_palette.setColor(QPalette.ColorRole.BrightText,      Qt.GlobalColor.red)
-        dark_palette.setColor(QPalette.ColorRole.Link,            QColor(42, 130, 218))
-        dark_palette.setColor(QPalette.ColorRole.Highlight,       QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.ColorRole.Window, QColor(45, 45, 45))
+        dark_palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
+        dark_palette.setColor(QPalette.ColorRole.Base, QColor(30, 30, 30))
+        dark_palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
+        dark_palette.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
+        dark_palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
+        dark_palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
+        dark_palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
+        dark_palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
+        dark_palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
+        dark_palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
         dark_palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
         QApplication.setPalette(dark_palette)
 
