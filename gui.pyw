@@ -386,6 +386,33 @@ class ServerEntryWidget(QWidget):
         self.retry_signal.emit(self.url)
         super().mouseDoubleClickEvent(event)
 
+class FolderEntryWidget(QWidget):
+    remove_signal = pyqtSignal(QListWidgetItem)
+
+    def __init__(self, path: str, parent_item: QListWidgetItem, parent=None):
+        super().__init__(parent)
+        self.path = path
+        self.parent_item = parent_item
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(6)
+
+        self.path_label = QLabel(path)
+        self.path_label.setStyleSheet("color: #ccc; font-size: 12px;")
+
+        self.remove_btn = QPushButton("✕")
+        self.remove_btn.setFixedSize(22, 22)
+        self.remove_btn.setStyleSheet(
+            "QPushButton { background: #555; border-radius: 3px; color: #ccc; font-size: 10px; }"
+            "QPushButton:hover { background: #e74c3c; color: white; }"
+        )
+        self.remove_btn.clicked.connect(lambda: self.remove_signal.emit(self.parent_item))
+
+        layout.addWidget(self.path_label, 1)
+        layout.addWidget(self.remove_btn)
+        self.setLayout(layout)
+
 
 # ══════════════════════════════════════════════════════════════
 # 主窗口
@@ -412,6 +439,11 @@ class TTSApp(QWidget):
         for url in self._settings.get("servers", []):
             if url:
                 self._restore_server(url)
+
+        # 恢复上次的文件夹列表
+        for path in self._settings.get("srt_paths", []):
+            if path and os.path.isdir(path):
+                self._add_folder_row(path)
 
         # 若没有保存的服务器，用 config 默认值
         if not self._settings.get("servers") and config.GRADIO_URL:
@@ -464,22 +496,31 @@ class TTSApp(QWidget):
         settings_layout = QVBoxLayout()
         settings_layout.setSpacing(10)
 
-        # SRT Folder
+        # SRT Folders
         path_layout = QHBoxLayout()
-        path_label = QLabel("SRT Folder:")
+        path_label = QLabel("SRT Folders:")
         path_label.setFixedWidth(90)
-        self.path_input = QLineEdit(self.current_srt_path)
-        self.path_input.setReadOnly(True)
-        self.path_input.setMinimumHeight(32)
-        self.path_btn = QPushButton('Browse')
-        self.path_btn.setFixedWidth(90)
-        self.path_btn.setMinimumHeight(32)
-        self.path_btn.clicked.connect(self.select_folder)
+
+        self.folder_list = QListWidget()
+        self.folder_list.setFixedHeight(110)
+        self.folder_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.folder_list.setStyleSheet(
+            "QListWidget { background: #1e1e1e; border: 1px solid #444; border-radius: 4px; }"
+            "QListWidget::item { border-bottom: 1px solid #2a2a2a; }"
+        )
+
+        self.add_folder_btn = QPushButton('Browse')
+        self.add_folder_btn.setFixedWidth(90)
+        self.add_folder_btn.setMinimumHeight(32)
+        self.add_folder_btn.clicked.connect(self.add_folder)
+
         path_layout.addWidget(path_label)
-        path_layout.addWidget(self.path_input)
+        path_layout.addWidget(self.folder_list, 1)
         path_layout.addSpacing(5)
-        path_layout.addWidget(self.path_btn)
+        path_layout.addWidget(self.add_folder_btn)
         settings_layout.addLayout(path_layout)
+
+        self._folder_widgets: dict = {}
 
         # 只读摘要行（Line Index & 总线程数，点 Settings 才能改）
         summary_layout = QHBoxLayout()
@@ -650,7 +691,7 @@ class TTSApp(QWidget):
 
     # ── 持久化 ──────────────────────────────────
     def _save_current_settings(self):
-        self._settings["srt_path"] = self.current_srt_path
+        self._settings["srt_paths"] = list(self._folder_widgets.keys())
         self._settings["servers"] = list(self._server_widgets.keys())
         save_settings(self._settings)
 
@@ -713,12 +754,15 @@ class TTSApp(QWidget):
         }
 
     def _update_run_btn(self):
-        if self._get_server_configs():
+        if self._get_server_configs() and self._folder_widgets:
             self.run_btn.setEnabled(True)
             self.run_btn.setToolTip("")
         else:
             self.run_btn.setEnabled(False)
-            self.run_btn.setToolTip("Please connect to at least one API server first.")
+            if not self._folder_widgets:
+                self.run_btn.setToolTip("Please add at least one SRT folder.")
+            else:
+                self.run_btn.setToolTip("Please connect to at least one API server first.")
 
     def _retry_server_connection(self, url: str):
         if url not in self._server_widgets:
@@ -818,6 +862,27 @@ class TTSApp(QWidget):
         self._update_run_btn()
         self._save_current_settings()
 
+    def _add_folder_row(self, path: str):
+        if path in self._folder_widgets:
+            return
+        item = QListWidgetItem(self.folder_list)
+        entry = FolderEntryWidget(path, item, self)
+        entry.remove_signal.connect(self._remove_folder_item)
+        item.setSizeHint(entry.sizeHint())
+        self.folder_list.addItem(item)
+        self.folder_list.setItemWidget(item, entry)
+        self._folder_widgets[path] = (item, entry)
+
+    def _remove_folder_item(self, item: QListWidgetItem):
+        widget = self.folder_list.itemWidget(item)
+        path = widget.path if widget else None
+        row = self.folder_list.row(item)
+        self.folder_list.takeItem(row)
+        if path and path in self._folder_widgets:
+            del self._folder_widgets[path]
+        self._save_current_settings()
+        self._update_run_btn()
+
     # ── 熔断事件 ───────────────────────────────
     def _on_server_down(self, url: str, stats: str):
         """某台服务器触发熔断时调用"""
@@ -851,14 +916,20 @@ class TTSApp(QWidget):
         QTimer.singleShot(8000, lambda: self._tray.setIcon(_make_icon("#3498db")))
 
     # ── 其他控件 ───────────────────────────────
-    def select_folder(self):
+    def add_folder(self):
         folder = QFileDialog.getExistingDirectory(
-            self, "Select Directory", self.current_srt_path or "/"
+            self, "Select Directory",
+            self.srt_paths[-1] if self.srt_paths else os.path.expanduser("~")
         )
-        if folder:
-            self.current_srt_path = folder
-            self.path_input.setText(folder)
-            self._save_current_settings()
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        if folder in self._folder_widgets:
+            self.append_log(f"> 文件夹已存在: {folder}")
+            return
+        self._add_folder_row(folder)
+        self._save_current_settings()
+        self._update_run_btn()
 
     def start_processing(self):
         line_idx = self._settings.get("line_index", 2)
