@@ -241,7 +241,7 @@ def _check_task_skip_or_recover(subtitle_name, output_folder_zh, output_audio_fi
     return "process"
 
 
-def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
+def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                       max_workers: int = 2,
                       output_path: str = None, ref_audio_path: str = None,
                       progress_callback=None,
@@ -250,14 +250,16 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
                       on_all_down=None,
                       max_retries: int = None):
     """
-    主处理函数。
+    主处理函数。srt_paths 可以是单个字符串（兼容旧调用）或字符串列表。
     """
 
     def log(msg):
         logger_log("MAIN", msg)
 
-    # ── 路径规范化（修复 Windows 混合斜杠 + 长路径问题）──
-    srt_path = os.path.normpath(srt_path)
+    # ── 兼容旧调用：单个字符串转为列表 ──
+    if isinstance(srt_paths, str):
+        srt_paths = [srt_paths]
+    srt_paths = [os.path.normpath(p) for p in srt_paths]
 
     def _longpath(p: str) -> str:
         """Windows 下添加长路径前缀，避免 MAX_PATH 260 字符限制"""
@@ -273,57 +275,60 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
     else:
         log(f"[模式] 单服务器模式，并发线程: {max_workers}")
 
-    if output_path is None: output_path = srt_path
-    if ref_audio_path is None: ref_audio_path = os.path.join(srt_path, "REF_AUDIO_PATH")
-
-    os.makedirs(ref_audio_path, exist_ok=True)
-    output_folder_zh = os.path.join(srt_path, "中配")
-    os.makedirs(output_folder_zh, exist_ok=True)
-
+    # ── 预扫描所有文件夹，统计 SRT 文件总数 ──
+    all_folder_files: list = []  # [(srt_path, srt_file), ...]
     valid_extensions = {".srt", ".txt"}
-    try:
-        srt_files_to_process = [
-            f for f in os.listdir(srt_path)
-            if os.path.splitext(f)[1].lower() in valid_extensions
-               and not f.endswith("zh.srt") and not f.endswith("en.srt")
-        ]
-    except FileNotFoundError:
-        log(f"错误: 路径不存在 {srt_path}")
-        return
+    for _srt_path in srt_paths:
+        try:
+            files = [
+                f for f in os.listdir(_srt_path)
+                if os.path.splitext(f)[1].lower() in valid_extensions
+                   and not f.endswith("zh.srt") and not f.endswith("en.srt")
+            ]
+        except FileNotFoundError:
+            log(f"错误: 路径不存在 {_srt_path}")
+            continue
+        try:
+            files = sorted(files, key=lambda x: int(re.findall(r'\d+', x)[0]))
+        except (IndexError, ValueError):
+            files.sort()
+        seen = set()
+        for f in files:
+            base = os.path.splitext(f)[0]
+            if base not in seen:
+                seen.add(base)
+                all_folder_files.append((_srt_path, f))
 
-    try:
-        srt_files_to_process = sorted(srt_files_to_process, key=lambda x: int(re.findall(r'\d+', x)[0]))
-    except (IndexError, ValueError):
-        srt_files_to_process.sort()
-
-    # Dedup by base name while preserving order
-    seen = set()
-    unique_files = []
-    for f in srt_files_to_process:
-        base = os.path.splitext(f)[0]
-        if base not in seen:
-            seen.add(base)
-            unique_files.append(f)
-    srt_files_to_process = unique_files
-    total_files = len(srt_files_to_process)
+    total_files = len(all_folder_files)
     if progress_callback:
         progress_callback.set_total_files(total_files)
 
+    global_file_idx = 0
     processed_basenames = set()
 
-    for i, srt_file in enumerate(srt_files_to_process):
+    for srt_path, srt_file in all_folder_files:
         if config.ABORT_ALL:
             log("!!! 任务已由用户强制终止 !!!")
             break
 
         subtitle_name, _ = os.path.splitext(srt_file)
-        if subtitle_name in processed_basenames:
+        dedup_key = (srt_path, subtitle_name)
+        if dedup_key in processed_basenames:
+            global_file_idx += 1
             continue
-        processed_basenames.add(subtitle_name)
+        processed_basenames.add(dedup_key)
+
+        # Per-folder output paths
+        output_path = srt_path
+        output_folder_zh = os.path.join(srt_path, "中配")
+        os.makedirs(output_folder_zh, exist_ok=True)
+        ref_audio_path = os.path.join(srt_path, "REF_AUDIO_PATH")
+        os.makedirs(ref_audio_path, exist_ok=True)
 
         if progress_callback:
-            progress_callback.update_file_progress(i)
-        log(f"\n[{i + 1}/{total_files}] === 检查文件 {srt_file} ===")
+            progress_callback.update_file_progress(global_file_idx)
+        log(f"\n[{global_file_idx + 1}/{total_files}] === 检查文件 {srt_file} ===")
+        log(f"  目录: {srt_path}")
 
         output_audio_file = os.path.join(output_path, f"{subtitle_name}.wav")
 
@@ -331,6 +336,7 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
             subtitle_name, output_folder_zh, output_audio_file, srt_path, log
         )
         if skip_result == "skip":
+            global_file_idx += 1
             continue
 
         main_audio_path = os.path.join(ref_audio_path, subtitle_name + ".wav")
@@ -344,12 +350,16 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
                     audio_extracted_in_this_run = True
                 else:
                     log(f"!! ffmpeg 提取音频失败，跳过此文件。")
+                    global_file_idx += 1
                     continue
             else:
                 log(f"!! 警告: 在 '{srt_path}' 下找不到与 '{subtitle_name}' 匹配的视频文件，跳过。")
+                global_file_idx += 1
                 continue
 
-        if not os.path.exists(main_audio_path): continue
+        if not os.path.exists(main_audio_path):
+            global_file_idx += 1
+            continue
 
         log(f"开始生成: {srt_file}")
         safe_dir_name = hashlib.md5(subtitle_name.encode('utf-8')).hexdigest()
@@ -364,12 +374,14 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
         except Exception as e:
             log(f"读取文件失败: {e}")
             if audio_extracted_in_this_run and os.path.exists(main_audio_path): os.remove(main_audio_path)
+            global_file_idx += 1
             continue
 
         parsed_subtitles = parse_subtitles(file_content, transformers_line)
         if not parsed_subtitles:
             log(f"无有效字幕，跳过。")
             if audio_extracted_in_this_run and os.path.exists(main_audio_path): os.remove(main_audio_path)
+            global_file_idx += 1
             continue
 
         merged_subtitles = merge_consecutive_subtitles(parsed_subtitles)
@@ -585,16 +597,20 @@ def process_srt_files(srt_path: str, transformers_line: int = TRANSFORMERS_LINE,
                 except OSError:
                     pass
 
+        global_file_idx += 1
+
     if progress_callback:
         progress_callback.update_file_progress(total_files)
     msg = "\n=== 任务已强制停止 ===" if config.ABORT_ALL else "\n=== 所有任务处理完毕 ==="
     log(msg)
 
-    if os.path.exists(ref_audio_path) and not os.listdir(ref_audio_path):
-        try:
-            os.rmdir(ref_audio_path)
-        except:
-            pass
+    for _srt_path in srt_paths:
+        ref_ap = os.path.join(_srt_path, "REF_AUDIO_PATH")
+        if os.path.exists(ref_ap) and not os.listdir(ref_ap):
+            try:
+                os.rmdir(ref_ap)
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':
