@@ -11,7 +11,7 @@ import subprocess
 
 import config
 from config import (
-    SRT_PATH, REF_AUDIO_PATH, OUTPUT_PATH,
+    SRT_PATH,
     MODEL_PATH, TRAINING_THRESHOLD, MIN_SPEED, MAX_SPEED,
     TRANSFORMERS_LINE, USE_TQDM_PROGRESS_BAR, model_lock, status_lock
 )
@@ -243,7 +243,6 @@ def _check_task_skip_or_recover(subtitle_name, output_folder_zh, output_audio_fi
 
 def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                       max_workers: int = 2,
-                      output_path: str = None, ref_audio_path: str = None,
                       progress_callback=None,
                       server_configs: Dict[str, int] = None,
                       on_server_down=None,
@@ -256,7 +255,9 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
     def log(msg):
         logger_log("MAIN", msg)
 
-    # ── 兼容旧调用：单个字符串转为列表 ──
+    # ── 兼容旧调用：None/单个字符串转为列表 ──
+    if srt_paths is None:
+        srt_paths = []
     if isinstance(srt_paths, str):
         srt_paths = [srt_paths]
     srt_paths = [os.path.normpath(p) for p in srt_paths]
@@ -614,6 +615,4 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
 
 
 if __name__ == '__main__':
-    os.makedirs(OUTPUT_PATH, exist_ok=True)
-    os.makedirs(REF_AUDIO_PATH, exist_ok=True)
     process_srt_files(SRT_PATH, TRANSFORMERS_LINE)
