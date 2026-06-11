@@ -17,7 +17,7 @@ from config import (
 )
 from logger import log as logger_log
 from utils import load_status, save_status, clear_status, time_str_to_seconds
-from subtitle_parser import parse_subtitles, merge_consecutive_subtitles
+from subtitle_parser import parse_subtitles, merge_contiguous_subtitles
 from audio_processor import (
     extract_single_audio, merge_single_audio_video, crop_audio,
     adjust_duration_with_rubberband, merge_audio
@@ -90,7 +90,7 @@ def tts_generation_task(index: int, subtitle: List, main_reference_audio: str, c
     if not reference_clip or len(reference_clip) < 500:
         return None, 0, text, 0
 
-    target_duration_s = len(reference_clip) / 1000.0
+    target_duration_s = time_str_to_seconds(end_time) - time_str_to_seconds(start_time)
     predicted_raw_duration_s = duration_predictor.predict_duration(text)
     required_speed = (predicted_raw_duration_s / target_duration_s) if predicted_raw_duration_s > 0.1 else 1.0
     applied_speed = max(MIN_SPEED, min(required_speed, MAX_SPEED))
@@ -186,6 +186,34 @@ def _find_and_merge_video(base_name_no_ext, audio_path, output_folder_zh, srt_pa
             log(f"!! 合并失败: {e}")
     else:
         log(f"!! 警告: 未能为 '{base_name_no_ext}' 找到匹配的视频文件，跳过合并。")
+
+
+def _recover_last_ref(current_tmp_dir, uncompleted_indices, log):
+    """从上次中断的 ref_clips 中恢复最后一个有效参考音频路径。"""
+    ref_tmp_dir = os.path.join(current_tmp_dir, "ref_clips")
+    if not os.path.isdir(ref_tmp_dir) or not uncompleted_indices:
+        return None
+    first_uncompleted = uncompleted_indices[0]
+    best_path = None
+    best_idx = -1
+    try:
+        for f in os.listdir(ref_tmp_dir):
+            if not (f.startswith("ref_") and f.endswith(".wav")):
+                continue
+            try:
+                idx = int(f[4:-4])
+            except ValueError:
+                continue
+            if idx < first_uncompleted and idx > best_idx:
+                candidate = os.path.join(ref_tmp_dir, f)
+                if os.path.getsize(candidate) > 1000:
+                    best_idx = idx
+                    best_path = candidate
+    except OSError:
+        return None
+    if best_path:
+        log(f"  -> [恢复系统] 从历史参考片段恢复 fallback 音频: ref_{best_idx}.wav")
+    return best_path
 
 
 def _check_task_skip_or_recover(subtitle_name, output_folder_zh, output_audio_file,
@@ -385,10 +413,15 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
             global_file_idx += 1
             continue
 
-        merged_subtitles = merge_consecutive_subtitles(parsed_subtitles)
+        # 合并连续字幕，减少 API 调用次数
+        original_count = len(parsed_subtitles)
+        parsed_subtitles = merge_contiguous_subtitles(parsed_subtitles, config.MERGE_MAX_CHARS)
+        merged_count = len(parsed_subtitles)
+        if merged_count < original_count:
+            log(f"  字幕合并: {original_count} 条 → {merged_count} 条")
 
         completed_indices = load_status(local_status_file, srt_file)
-        all_indices = list(range(len(merged_subtitles)))
+        all_indices = list(range(len(parsed_subtitles)))
 
         recovered_count = 0
         for idx in all_indices:
@@ -486,13 +519,16 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                 task_params_map = {}
 
                 def task_iterator():
-                    last_valid_ref_path = None
+                    # 恢复上次中断前最后一个有效的参考音频片段
+                    last_valid_ref_path = _recover_last_ref(
+                        current_tmp_dir, uncompleted_indices, log
+                    )
                     for index in uncompleted_indices:
                         if config.ABORT_ALL:
                             return
 
                         params = _prepare_tts_params(
-                            index, merged_subtitles[index],
+                            index, parsed_subtitles[index],
                             main_audio_path, current_tmp_dir,
                             last_valid_ref_path=last_valid_ref_path
                         )
@@ -541,7 +577,7 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                     futures = set()
                     for index in uncompleted_indices:
                         if config.ABORT_ALL: break
-                        subtitle = merged_subtitles[index]
+                        subtitle = parsed_subtitles[index]
                         gen_future = executor.submit(tts_generation_task, index, subtitle,
                                                      main_audio_path, current_tmp_dir)
 
@@ -581,7 +617,7 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
 
         log("--- 字幕片段合并中... ---")
         try:
-            merged_audio = merge_audio(merged_subtitles, current_tmp_dir)
+            merged_audio = merge_audio(parsed_subtitles, current_tmp_dir)
             merged_audio.export(output_audio_file, format="wav")
             log(f"输出音频: {os.path.basename(output_audio_file)}")
             clear_status(local_status_file)
