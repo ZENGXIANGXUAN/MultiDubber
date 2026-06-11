@@ -33,7 +33,8 @@ DEFAULT_SETTINGS = {
     "servers": [],
     "api_public_key": "",  # 新增：公钥
     "api_private_key": "",  # 新增：私钥
-    "api_hostid": ""  # 新增：Host ID
+    "api_hostid": "",  # 新增：Host ID
+    "merge_max_chars": 30,  # 字幕合并字数上限，0=禁用
 }
 
 
@@ -118,7 +119,8 @@ class SettingsDialog(QDialog):
                  webhook_url: str = "",
                  api_public_key: str = "",
                  api_private_key: str = "",
-                 api_hostid: str = ""):
+                 api_hostid: str = "",
+                 merge_max_chars: int = 30):
         super().__init__(parent)
         self.setWindowTitle("⚙️  Settings")
         self.setMinimumWidth(500)
@@ -139,6 +141,18 @@ class SettingsDialog(QDialog):
         self.spin_line.setMinimumHeight(32)
         self.spin_line.setToolTip("字幕文件中翻译文本所在的行号（从0开始）")
         form.addRow("Line Index:", self.spin_line)
+
+        # Merge Max Chars
+        self.spin_merge_chars = QSpinBox()
+        self.spin_merge_chars.setRange(0, 200)
+        self.spin_merge_chars.setValue(merge_max_chars)
+        self.spin_merge_chars.setMinimumHeight(32)
+        self.spin_merge_chars.setToolTip(
+            "合并后文本的最大字符数。\n"
+            "连续字幕在不超此限制时会合并为一条，减少 API 调用。\n"
+            "设为 0 禁用合并功能。"
+        )
+        form.addRow("合并字数上限:", self.spin_merge_chars)
 
         # Total Threads
         self.spin_threads = QSpinBox()
@@ -245,6 +259,10 @@ class SettingsDialog(QDialog):
     @property
     def api_hostid(self) -> str:
         return self.hostid_input.text().strip()
+
+    @property
+    def merge_max_chars(self) -> int:
+        return self.spin_merge_chars.value()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -527,11 +545,13 @@ class TTSApp(QWidget):
         self.lbl_line_summary = QLabel(f"Line Index: {self._settings['line_index']}")
         self.lbl_thread_summary = QLabel(f"总线程数: {self._settings['total_threads']}")
         self.lbl_retry_summary = QLabel(f"最大重试: {self._settings.get('max_retries', 3)}")
+        self.lbl_merge_summary = QLabel(f"合并字数: {self._settings.get('merge_max_chars', 30)}")
         self.lbl_webhook_summary = QLabel()
         self._refresh_summary_labels()
 
         for lbl in (self.lbl_line_summary, self.lbl_thread_summary,
-                    self.lbl_retry_summary, self.lbl_webhook_summary):
+                    self.lbl_retry_summary, self.lbl_merge_summary,
+                    self.lbl_webhook_summary):
             lbl.setStyleSheet("color: #aaa; font-size: 12px;")
 
         hint_btn = QPushButton("⚙️ 修改")
@@ -547,6 +567,8 @@ class TTSApp(QWidget):
         summary_layout.addWidget(self.lbl_thread_summary)
         summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_retry_summary)
+        summary_layout.addSpacing(20)
+        summary_layout.addWidget(self.lbl_merge_summary)
         summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_webhook_summary)
         summary_layout.addStretch()
@@ -652,7 +674,8 @@ class TTSApp(QWidget):
             webhook_url=self._settings.get("webhook_url", ""),
             api_public_key=self._settings.get("api_public_key", ""),
             api_private_key=self._settings.get("api_private_key", ""),
-            api_hostid=self._settings.get("api_hostid", "")
+            api_hostid=self._settings.get("api_hostid", ""),
+            merge_max_chars=self._settings.get("merge_max_chars", 30),
         )
         # 应用暗色样式到对话框
         dlg.setStyleSheet(self.styleSheet())
@@ -666,6 +689,10 @@ class TTSApp(QWidget):
             self._settings["api_public_key"] = dlg.api_public_key
             self._settings["api_private_key"] = dlg.api_private_key
             self._settings["api_hostid"] = dlg.api_hostid
+            self._settings["merge_max_chars"] = dlg.merge_max_chars
+
+            # 同步到 config 模块
+            config.MERGE_MAX_CHARS = dlg.merge_max_chars
 
             self._save_current_settings()
             self._refresh_summary_labels()
@@ -674,6 +701,7 @@ class TTSApp(QWidget):
                 f"> Settings saved — Line Index: {dlg.line_index}, "
                 f"总线程数: {dlg.total_threads}, "
                 f"最大重试: {dlg.max_retries}, "
+                f"合并字数上限: {dlg.merge_max_chars}, "
                 f"Webhook: {'已设置' if dlg.webhook_url else '未设置'}"
             )
 
@@ -681,6 +709,7 @@ class TTSApp(QWidget):
         self.lbl_line_summary.setText(f"Line Index: {self._settings['line_index']}")
         self.lbl_thread_summary.setText(f"总线程数: {self._settings['total_threads']}")
         self.lbl_retry_summary.setText(f"最大重试: {self._settings.get('max_retries', 3)}")
+        self.lbl_merge_summary.setText(f"合并字数: {self._settings.get('merge_max_chars', 30)}")
         wh = self._settings.get("webhook_url", "")
         if wh:
             # 只显示域名部分，避免泄露完整 key
