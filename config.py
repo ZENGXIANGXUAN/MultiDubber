@@ -9,8 +9,6 @@ USE_TQDM_PROGRESS_BAR = True
 TRANSFORMERS_LINE = 2
 TIME_LINE = 1
 ENGLISH_LINE = -1
-MAX_SUBTITLE_LENGTH = 35
-
 # === API Configuration ===
 GRADIO_URL = "http://127.0.0.1:7860/"
 
@@ -41,3 +39,6 @@ status_lock = threading.Lock()
 
 # === Global Control Flags ===
 ABORT_ALL = False
+
+# === 字幕合并配置 ===
+MERGE_MAX_CHARS = 30  # 合并后文本最大字符数，0 表示禁用合并
