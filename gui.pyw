@@ -962,6 +962,7 @@ class TTSApp(QWidget):
 
     def start_processing(self):
         line_idx = self._settings.get("line_index", 2)
+        config.MERGE_MAX_CHARS = self._settings.get("merge_max_chars", 30)
         server_configs = self._get_server_configs()
         if not server_configs:
             self.append_log("Error: No online servers available.")
