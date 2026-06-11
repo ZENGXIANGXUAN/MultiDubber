@@ -33,7 +33,7 @@ class TestMergeContiguousSubtitles:
     def test_no_merge_exceeds_max_chars(self):
         """合并后超过字数限制的不应合并"""
         input_data = [
-            ["00:00:01,000", "00:00:03,000", "这是一段比较长的字幕内容，", ""],
+            ["00:00:01,000", "00:00:03,000", "这是一段比较长的字幕内容，需要超过限制才行", ""],
             ["00:00:03,000", "00:00:05,000", "再加上这一段就会超过限制了。", ""],
         ]
         result = merge_contiguous_subtitles(input_data, max_chars=30)
