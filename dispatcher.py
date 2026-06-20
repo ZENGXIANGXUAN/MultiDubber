@@ -72,7 +72,7 @@ def invalidate_client(url: str):
 # ──────────────────────────────────────────────
 def _call_api_on_server(url: str, ref_audio_path: str,
                         gen_text: str, speed: float,
-                        task_id=None) -> Optional[str]:
+                        task_id=None, queue_size="?") -> Optional[str]:
     if not os.path.exists(ref_audio_path):
         _log("API_ERR", f"Task {task_id} 参考音频不存在: {ref_audio_path}")
         return None
@@ -88,12 +88,11 @@ def _call_api_on_server(url: str, ref_audio_path: str,
             if elapsed >= HANG_API_THRESHOLD_S:
                 _log("API_HANG",
                      f"{label} | 已等待 {elapsed:.1f}s — 推理端疑似卡死！"
-                     f" 队列深度={_hang_watcher.queue_size}")
+                     f" 队列深度={queue_size}")
             else:
                 _log("API_SLOW",
                      f"{label} | 已等待 {elapsed:.1f}s — 推理偏慢，继续等待…"
-                     f" 队列深度={_hang_watcher.queue_size}")
-    _hang_watcher.queue_size = "?"  # 由 GPU Worker 在调用前填入
+                     f" 队列深度={queue_size}")
 
     watcher = threading.Thread(target=_hang_watcher, args=(time.time(),), daemon=True)
 
@@ -330,8 +329,14 @@ class MultiServerDispatcher:
         # Drain any remaining CPU tasks (should be none after workers exited)
         try:
             while True:
-                self._cpu_queue.get_nowait()
+                task = self._cpu_queue.get_nowait()
                 self._cpu_queue.task_done()
+                if task is not _SENTINEL:
+                    try:
+                        # 兜底：触发被静默丢弃的任务的回调，防止进度条死锁
+                        task.done_callback(task.task_id, task.server_url)
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
 
@@ -397,8 +402,6 @@ class MultiServerDispatcher:
             raw_path = None
             success  = False
             try:
-                # 把队列大小注入到 hang_watcher（通过 _call_api_on_server 内部函数属性传递）
-                # 这里直接在调用前记录，简单有效
                 q_depth = self._gpu_queue.qsize()
                 _log("WORKER_PICK",
                      f"{worker_name} 取出 Task {task.task_id} "
@@ -406,7 +409,7 @@ class MultiServerDispatcher:
 
                 raw_path = _call_api_on_server(
                     url, task.ref_audio_path, task.gen_text, task.speed,
-                    task_id=task.task_id
+                    task_id=task.task_id, queue_size=q_depth
                 )
                 success = raw_path is not None
             except Exception as e:
