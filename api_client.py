@@ -1,50 +1,49 @@
 import os
+import threading
 from typing import Optional
 from gradio_client import Client, file
 import warnings
-import config  # 导入配置
+import config
+from logger import log as _log
 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=UserWarning, module='gradio_client.utils')
 
+# Thread-local storage for per-thread Client instances
+_thread_local = threading.local()
+
 
 def test_connection(url: str) -> bool:
-    """
-    测试 Gradio 服务连接是否正常
-    """
     try:
-        print(f"正在测试连接: {url} ...")
-        # 尝试初始化客户端，如果连接失败会抛出异常
+        _log("CONNECT", f"正在测试连接: {url} ...")
         Client(url)
-        print("连接成功！")
+        _log("CONNECT", "连接成功！")
         return True
     except Exception as e:
-        print(f"连接失败: {e}")
+        _log("CONNECT", f"连接失败: {e}")
         return False
 
 
 class TTSClient:
-    _client = None
-    _connected_url = None  # 记录当前连接的 URL
-
     @classmethod
     def get_client(cls):
-        # 如果客户端不存在，或者配置的 URL 变了，需要重新连接
-        if cls._client is None or cls._connected_url != config.GRADIO_URL:
+        # Each thread gets its own Client instance
+        if not hasattr(_thread_local, "client") or getattr(_thread_local, "connected_url", None) != config.GRADIO_URL:
             try:
-                print(f"--- 正在连接到 Gradio 服务 ({config.GRADIO_URL})... ---")
-                cls._client = Client(config.GRADIO_URL)
-                cls._connected_url = config.GRADIO_URL
-                print("--- 连接成功！ ---")
+                thread_name = threading.current_thread().name
+                _log("CONNECT", f"[{thread_name}] 正在连接到 Gradio 服务 ({config.GRADIO_URL})...")
+                _thread_local.client = Client(config.GRADIO_URL)
+                _thread_local.connected_url = config.GRADIO_URL
+                _log("CONNECT", f"[{thread_name}] 连接成功！")
             except Exception as e:
-                print(f"!! 无法连接到 Gradio 服务。错误: {e}")
+                _log("CONNECT", f"[{thread_name}] 无法连接到 Gradio 服务。错误: {e}")
                 raise e
-        return cls._client
+        return _thread_local.client
 
 
 def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float) -> Optional[str]:
     if not os.path.exists(ref_audio_path):
-        print(f"\n[ERROR] 参考音频文件不存在: {ref_audio_path}")
+        _log("API_ERR", f"参考音频文件不存在: {ref_audio_path}")
         return None
 
     try:
@@ -57,5 +56,5 @@ def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float) -> Opti
         )
         return result["value"] if result else None
     except Exception as e:
-        print(f"API 调用失败: {e}")
+        _log("API_ERR", f"API 调用失败: {e}")
         return None
