@@ -13,8 +13,14 @@ import queue
 import threading
 import time
 from typing import Dict, Iterable, List, Callable, Optional, Tuple
-from gradio_client import Client, file as gradio_file
+from gradio_client import Client
 import warnings
+
+# ✨ 动态适配器：安全引入 Gradio 5.x 强制要求的 handle_file，并向下兼容旧版 file
+try:
+    from gradio_client import handle_file as gradio_file
+except ImportError:
+    from gradio_client import file as gradio_file
 
 from logger import log as _log
 
@@ -123,28 +129,26 @@ def _call_api_on_server(url: str, ref_audio_path: str,
 
         # ═════════════════ 分支 2：2.0 新版本接口路由 ═════════════════
         else:
-            # 【修复 I1 设计决议】2.0 拓扑原生移除了前端 speed 控件。
-            # 下游 main.py 已常驻 rubberband 后处理做时长拉伸对齐，故安全忽略 speed。
-            # param_19 保持默认温度 0.8，拒绝向温度灌入语速浮点数以防音频崩坏。
+            # ✨ 核心修复：100% 遵照组件命名规范改用关键字参数传参，杜绝位置错位导致的组件类型异常
             result = client.predict(
-                "Same as the voice reference",   # [0] emo_control_method (默认跟随音频)
-                gradio_file(ref_audio_path),     # [1] prompt (参考音频)
-                gen_text,                        # [2] text (目标文本)
-                gradio_file(ref_audio_path),     # [3] emo_ref_path (情感参考音频占位)
-                0.65,                            # [4] emo_weight
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, # [5]-[12] vec1~vec8 (情感向量滑块默认清零)
-                "",                              # [13] emo_text (情感描述文本为空)
-                False,                           # [14] emo_random (关闭随机采样)
-                120.0,                           # [15] max_text_tokens_per_segment
-                True,                            # [16] param_16 (do_sample)
-                0.8,                             # [17] param_17 (top_p)
-                30.0,                            # [18] param_18 (top_k)
-                0.8,                             # [19] param_19 (temperature)
-                0.0,                             # [20] param_20 (length_penalty)
-                3.0,                             # [21] param_21 (num_beams)
-                10.0,                            # [22] param_22 (repetition_penalty)
-                1500.0,                          # [23] param_23 (max_mel_tokens)
-                api_name="/gen_single"           # v2.0 真实注册端点
+                emo_control_method="Same as the voice reference",
+                prompt=gradio_file(ref_audio_path),
+                text=gen_text,
+                emo_ref_path=gradio_file(ref_audio_path),
+                emo_weight=0.65,
+                vec1=0.0, vec2=0.0, vec3=0.0, vec4=0.0, vec5=0.0, vec6=0.0, vec7=0.0, vec8=0.0,
+                emo_text="",
+                emo_random=False,
+                max_text_tokens_per_segment=120.0,
+                param_16=True,
+                param_17=0.8,
+                param_18=30.0,
+                param_19=0.8,
+                param_20=0.0,
+                param_21=3.0,
+                param_22=10.0,
+                param_23=1500.0,
+                api_name="/gen_single"
             )
             elapsed = time.time() - t0
             if DEBUG_DISPATCHER:

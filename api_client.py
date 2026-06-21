@@ -1,7 +1,13 @@
 import os
 import threading
 from typing import Optional
-from gradio_client import Client, file
+from gradio_client import Client
+
+# ✨ 确保单机模式与集群模式共享相同的 Gradio 5.x/4.x 文件包装适配器
+try:
+    from gradio_client import handle_file as file
+except ImportError:
+    from gradio_client import file
 import warnings
 import config
 from logger import log as _log
@@ -87,25 +93,26 @@ def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float) -> Opti
             return None
         else:
             # v2.0: speed 由下游 rubberband 后处理对齐，此处不传入
+            # ✨ 核心修复：改用关键字参数传参，杜绝位置错位导致的组件类型异常
             result = client.predict(
-                "Same as the voice reference",   # [0] emo_control_method
-                file(ref_audio_path),            # [1] prompt
-                gen_text,                        # [2] text
-                file(ref_audio_path),            # [3] emo_ref_path
-                0.65,                            # [4] emo_weight
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # [5]-[12] vec1~vec8
-                "",                              # [13] emo_text
-                False,                           # [14] emo_random
-                120.0,                           # [15] max_text_tokens_per_segment
-                True,                            # [16] do_sample
-                0.8,                             # [17] top_p
-                30.0,                            # [18] top_k
-                0.8,                             # [19] temperature
-                0.0,                             # [20] length_penalty
-                3.0,                             # [21] num_beams
-                10.0,                            # [22] repetition_penalty
-                1500.0,                          # [23] max_mel_tokens
-                api_name="/gen_single"           # v2.0 真实注册端点
+                emo_control_method="Same as the voice reference",
+                prompt=file(ref_audio_path),
+                text=gen_text,
+                emo_ref_path=file(ref_audio_path),
+                emo_weight=0.65,
+                vec1=0.0, vec2=0.0, vec3=0.0, vec4=0.0, vec5=0.0, vec6=0.0, vec7=0.0, vec8=0.0,
+                emo_text="",
+                emo_random=False,
+                max_text_tokens_per_segment=120.0,
+                param_16=True,
+                param_17=0.8,
+                param_18=30.0,
+                param_19=0.8,
+                param_20=0.0,
+                param_21=3.0,
+                param_22=10.0,
+                param_23=1500.0,
+                api_name="/gen_single"
             )
             if result is None:
                 return None
