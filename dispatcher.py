@@ -129,25 +129,25 @@ def _call_api_on_server(url: str, ref_audio_path: str,
 
         # ═════════════════ 分支 2：2.0 新版本接口路由 ═════════════════
         else:
-            # ✨ 核心修复：100% 遵照组件命名规范改用关键字参数传参，杜绝位置错位导致的组件类型异常
+            # ✨ 严格类型对齐的 24 位位置参数流，int/float/bool 精确匹配后端断言
             result = client.predict(
-                emo_control_method="Same as the voice reference",
-                prompt=gradio_file(ref_audio_path),
-                text=gen_text,
-                emo_ref_path=gradio_file(ref_audio_path),
-                emo_weight=0.65,
-                vec1=0.0, vec2=0.0, vec3=0.0, vec4=0.0, vec5=0.0, vec6=0.0, vec7=0.0, vec8=0.0,
-                emo_text="",
-                emo_random=False,
-                max_text_tokens_per_segment=120.0,
-                param_16=True,
-                param_17=0.8,
-                param_18=30.0,
-                param_19=0.8,
-                param_20=0.0,
-                param_21=3.0,
-                param_22=10.0,
-                param_23=1500.0,
+                "Same as the voice reference",   # [0] 情感控制模式 (str)
+                gradio_file(ref_audio_path),     # [1] 参考音频主路径 (filepath)
+                gen_text,                        # [2] 目标文本 (str)
+                gradio_file(ref_audio_path),     # [3] 情感参考音频占位 (filepath)
+                0.65,                            # [4] 情感控制权重 (float)
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, # [5]-[12] vec1~vec8 (float)
+                "",                              # [13] 情感文本描述 (str)
+                False,                           # [14] 是否随机采样 (bool)
+                120,                             # [15] 每段最大Token数 (int)
+                True,                            # [16] do_sample (bool)
+                0.8,                             # [17] top_p (float)
+                30,                              # [18] top_k (int)
+                0.8,                             # [19] temperature (float)
+                0.0,                             # [20] length_penalty (float)
+                3,                               # [21] num_beams (int)
+                10.0,                            # [22] repetition_penalty (float)
+                1500,                            # [23] max_mel_tokens (int)
                 api_name="/gen_single"
             )
             elapsed = time.time() - t0

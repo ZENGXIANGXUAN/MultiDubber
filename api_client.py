@@ -93,25 +93,25 @@ def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float) -> Opti
             return None
         else:
             # v2.0: speed 由下游 rubberband 后处理对齐，此处不传入
-            # ✨ 核心修复：改用关键字参数传参，杜绝位置错位导致的组件类型异常
+            # ✨ 严格类型对齐的 24 位位置参数流，int/float/bool 精确匹配后端断言
             result = client.predict(
-                emo_control_method="Same as the voice reference",
-                prompt=file(ref_audio_path),
-                text=gen_text,
-                emo_ref_path=file(ref_audio_path),
-                emo_weight=0.65,
-                vec1=0.0, vec2=0.0, vec3=0.0, vec4=0.0, vec5=0.0, vec6=0.0, vec7=0.0, vec8=0.0,
-                emo_text="",
-                emo_random=False,
-                max_text_tokens_per_segment=120.0,
-                param_16=True,
-                param_17=0.8,
-                param_18=30.0,
-                param_19=0.8,
-                param_20=0.0,
-                param_21=3.0,
-                param_22=10.0,
-                param_23=1500.0,
+                "Same as the voice reference",   # [0]
+                file(ref_audio_path),            # [1]
+                gen_text,                        # [2]
+                file(ref_audio_path),            # [3]
+                0.65,                            # [4]
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, # [5]-[12]
+                "",                              # [13]
+                False,                           # [14]
+                120,                             # [15] int
+                True,                            # [16]
+                0.8,                             # [17]
+                30,                              # [18] int
+                0.8,                             # [19]
+                0.0,                             # [20]
+                3,                               # [21] int
+                10.0,                            # [22]
+                1500,                            # [23] int
                 api_name="/gen_single"
             )
             if result is None:
