@@ -242,7 +242,7 @@ class MultiServerDispatcher:
         for url in self.server_configs.keys():
             try:
                 cli = _get_client(url)
-                api_info = cli.api_info()
+                api_info = cli.view_api(return_format="dict", print_info=False)
 
                 if "/gen_single" in api_info.get("named_endpoints", {}):
                     self.server_versions[url] = "1.5"
