@@ -584,43 +584,57 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                 file_start_time = time.time()
                 session_processed_count = 0
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = set()
-                    for index in uncompleted_indices:
-                        if config.ABORT_ALL: break
-                        subtitle = parsed_subtitles[index]
-                        gen_future = executor.submit(tts_generation_task, index, subtitle,
-                                                     main_audio_path, current_tmp_dir)
+                # [OOM防护]：单机模式一次性载入主音频，避免每个线程重复读取
+                try:
+                    log("正在将参考主音频载入内存 (单机模式)...")
+                    loaded_main_audio = AudioSegment.from_file(main_audio_path)
+                except Exception as e:
+                    log(f"内存载入失败，回退至硬盘直读模式: {e}")
+                    loaded_main_audio = main_audio_path
 
-                        def process_when_done(fut, idx=index, pbar_instance=pbar):
-                            nonlocal completed_count, session_processed_count
-                            if config.ABORT_ALL: return
-                            try:
-                                gen_result = fut.result()
-                                post_result = post_process_audio_task(idx, *gen_result, current_tmp_dir)
-                                with status_lock:
-                                    completed_indices.add(post_result)
-                                    save_status(local_status_file, srt_file, completed_indices)
-                                    completed_count += 1
-                                    session_processed_count += 1
-                                    elapsed_time = time.time() - file_start_time
-                                    speed_str = ""
-                                    if elapsed_time > 0 and session_processed_count > 0:
-                                        speed = session_processed_count / elapsed_time
-                                        speed_str = f"{speed:.2f} it/s" if speed >= 1 else f"{1 / speed:.2f} s/it"
-                                    else:
-                                        speed_str = "Calc..."
-                                    if progress_callback:
-                                        progress_callback.update_task_progress(completed_count)
-                                    elif pbar_instance:
-                                        pbar_instance.update(1)
-                                    log(f"  -> Task {idx} 完成 ({completed_count}/{total_tasks}) [{speed_str}]")
-                            except Exception as e:
-                                log(f"!! [Task {idx}] 错误: {e}")
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = set()
+                        for index in uncompleted_indices:
+                            if config.ABORT_ALL: break
+                            subtitle = parsed_subtitles[index]
+                            gen_future = executor.submit(tts_generation_task, index, subtitle,
+                                                         loaded_main_audio, current_tmp_dir)
 
-                        gen_future.add_done_callback(process_when_done)
-                        futures.add(gen_future)
-                    concurrent.futures.wait(futures)
+                            def process_when_done(fut, idx=index, pbar_instance=pbar):
+                                nonlocal completed_count, session_processed_count
+                                if config.ABORT_ALL: return
+                                try:
+                                    gen_result = fut.result()
+                                    post_result = post_process_audio_task(idx, *gen_result, current_tmp_dir)
+                                    with status_lock:
+                                        completed_indices.add(post_result)
+                                        save_status(local_status_file, srt_file, completed_indices)
+                                        completed_count += 1
+                                        session_processed_count += 1
+                                        elapsed_time = time.time() - file_start_time
+                                        speed_str = ""
+                                        if elapsed_time > 0 and session_processed_count > 0:
+                                            speed = session_processed_count / elapsed_time
+                                            speed_str = f"{speed:.2f} it/s" if speed >= 1 else f"{1 / speed:.2f} s/it"
+                                        else:
+                                            speed_str = "Calc..."
+                                        if progress_callback:
+                                            progress_callback.update_task_progress(completed_count)
+                                        elif pbar_instance:
+                                            pbar_instance.update(1)
+                                        log(f"  -> Task {idx} 完成 ({completed_count}/{total_tasks}) [{speed_str}]")
+                                except Exception as e:
+                                    log(f"!! [Task {idx}] 错误: {e}")
+
+                            gen_future.add_done_callback(process_when_done)
+                            futures.add(gen_future)
+                        concurrent.futures.wait(futures)
+                finally:
+                    # [OOM防护]：单机模式任务队列派发并执行完毕后，强制清理内存
+                    if 'loaded_main_audio' in locals() and isinstance(loaded_main_audio, AudioSegment):
+                        del loaded_main_audio
+                        gc.collect()
 
                 if pbar: pbar.close()
 
