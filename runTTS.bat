@@ -1,9 +1,10 @@
 @echo off
-:: 1. 强制切换到当前 .bat 文件所在的目录，确保系统能准确找到 gui.pyw
+title Auto Dubbing Studio
+:: 切换到 .bat 文件所在目录
 cd /d "%~dp0"
 
-:: 2. start 后面先加一个空引号 "" 作为标题，防止路径被误认为标题
-:: 3. 建议使用 pythonw.exe 来运行 .pyw 文件，避免多余的黑框
-start "" "D:\Users\xuan\Mycode\MultTTS\.venv\Scripts\pythonw.exe" "gui.pyw"
+:: 使用 python.exe 启动（保留控制台以便查看错误信息）
+:: 如果用 pythonw.exe 则任何启动崩溃都看不到
+".venv\Scripts\python.exe" "gui.pyw"
 
-exit
+pause
