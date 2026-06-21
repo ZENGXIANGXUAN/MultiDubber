@@ -17,13 +17,14 @@ def test_connection(url: str) -> bool:
     try:
         _log("CONNECT", f"正在测试连接: {url} ...")
         cli = Client(url)
-        # 探测 API 版本：检查是否存在 1.5 专属端点 /gen_single
+        # 探测 API 版本：检查 v2.0 专属特征端点
         try:
             api_info = cli.view_api(return_format="dict", print_info=False)
-            if "/gen_single" in api_info.get("named_endpoints", {}):
-                version = "1.5"
-            else:
+            named_endpoints = api_info.get("named_endpoints", {})
+            if "/on_method_change" in named_endpoints or "/on_add_glossary_term" in named_endpoints:
                 version = "2.0"
+            else:
+                version = "1.5"
         except Exception:
             version = "未知"
         _log("CONNECT", f"连接成功！接口协议: v{version}")
@@ -43,13 +44,14 @@ class TTSClient:
                 _log("CONNECT", f"[{thread_name}] 正在连接到 Gradio 服务 ({config.GRADIO_URL})...")
                 _thread_local.client = Client(config.GRADIO_URL)
                 _thread_local.connected_url = config.GRADIO_URL
-                # 探测 API 版本
+                # 探测 API 版本：检查 v2.0 专属特征端点
                 try:
                     api_info = _thread_local.client.view_api(return_format="dict", print_info=False)
-                    if "/gen_single" in api_info.get("named_endpoints", {}):
-                        _thread_local.api_version = "1.5"
-                    else:
+                    named_endpoints = api_info.get("named_endpoints", {})
+                    if "/on_method_change" in named_endpoints or "/on_add_glossary_term" in named_endpoints:
                         _thread_local.api_version = "2.0"
+                    else:
+                        _thread_local.api_version = "1.5"
                 except Exception:
                     _thread_local.api_version = "1.5"
                 _log("CONNECT", f"[{thread_name}] 连接成功！接口协议: v{_thread_local.api_version}")
@@ -103,7 +105,7 @@ def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float) -> Opti
                 3.0,                             # [21] num_beams
                 10.0,                            # [22] repetition_penalty
                 1500.0,                          # [23] max_mel_tokens
-                api_name="/predict"
+                api_name="/gen_single"           # v2.0 真实注册端点
             )
             if result is None:
                 return None

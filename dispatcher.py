@@ -144,7 +144,7 @@ def _call_api_on_server(url: str, ref_audio_path: str,
                 3.0,                             # [21] param_21 (num_beams)
                 10.0,                            # [22] param_22 (repetition_penalty)
                 1500.0,                          # [23] param_23 (max_mel_tokens)
-                api_name="/predict"              # v2.0 默认预测路由
+                api_name="/gen_single"           # v2.0 真实注册端点
             )
             elapsed = time.time() - t0
             if DEBUG_DISPATCHER:
@@ -249,11 +249,13 @@ class MultiServerDispatcher:
             try:
                 cli = _get_client(url)
                 api_info = cli.view_api(return_format="dict", print_info=False)
+                named_endpoints = api_info.get("named_endpoints", {})
 
-                if "/gen_single" in api_info.get("named_endpoints", {}):
-                    self.server_versions[url] = "1.5"
-                else:
+                # 使用 v2.0 专属特征端点做精准判定（/gen_single 两代都有，不能用）
+                if "/on_method_change" in named_endpoints or "/on_add_glossary_term" in named_endpoints:
                     self.server_versions[url] = "2.0"
+                else:
+                    self.server_versions[url] = "1.5"
                 _log("INIT", f"✅ 节点连通测试成功: {url} | 成功识别接口协议: {self.server_versions[url]}")
             except Exception as e:
                 self.server_versions[url] = "1.5"
