@@ -144,9 +144,11 @@ def _call_api_on_server(url: str, ref_audio_path: str,
             if DEBUG_DISPATCHER:
                 _log("API_DONE", f"{label} (v2.0) | 耗时 {elapsed:.2f}s")
 
-            # v2.0 的 Gradio 如果返回了 File 字典，安全解出本地路径路径字符串
-            if isinstance(result, dict) and "name" in result:
-                return result["name"]
+            # v2.0 的 Gradio 如果返回了 File 字典，安全解出本地路径字符串
+            if result is None:
+                return None
+            if isinstance(result, dict):
+                return result.get("name")  # File dict → 路径字符串，无 "name" 则返回 None
             return result
 
     except Exception as e:
@@ -277,7 +279,8 @@ class MultiServerDispatcher:
         cfg = ", ".join(f"{u.rstrip('/').split(':')[-1]}×{n}({self.server_versions.get(u, '1.5')})"
                         for u, n in self.server_configs.items())
         _log("INIT", f"启动完成: GPU集群({cfg}) 共{total}线程 | "
-                     f"CPU {self.cpu_workers}线程 | 队列容量 {self._gpu_queue.maxsize}")
+                     f"CPU {self.cpu_workers}线程 | 队列容量 {self._gpu_queue.maxsize} | "
+                     f"任务最大重试 {self.max_retries} 次")
 
     def run_feeder(self,
                    task_iter: Iterable[Tuple],
