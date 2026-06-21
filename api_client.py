@@ -16,8 +16,17 @@ _thread_local = threading.local()
 def test_connection(url: str) -> bool:
     try:
         _log("CONNECT", f"正在测试连接: {url} ...")
-        Client(url)
-        _log("CONNECT", "连接成功！")
+        cli = Client(url)
+        # 探测 API 版本：检查是否存在 1.5 专属端点 /gen_single
+        try:
+            api_info = cli.view_api(return_format="dict", print_info=False)
+            if "/gen_single" in api_info.get("named_endpoints", {}):
+                version = "1.5"
+            else:
+                version = "2.0"
+        except Exception:
+            version = "未知"
+        _log("CONNECT", f"连接成功！接口协议: v{version}")
         return True
     except Exception as e:
         _log("CONNECT", f"连接失败: {e}")
