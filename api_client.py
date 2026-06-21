@@ -43,11 +43,25 @@ class TTSClient:
                 _log("CONNECT", f"[{thread_name}] 正在连接到 Gradio 服务 ({config.GRADIO_URL})...")
                 _thread_local.client = Client(config.GRADIO_URL)
                 _thread_local.connected_url = config.GRADIO_URL
-                _log("CONNECT", f"[{thread_name}] 连接成功！")
+                # 探测 API 版本
+                try:
+                    api_info = _thread_local.client.view_api(return_format="dict", print_info=False)
+                    if "/gen_single" in api_info.get("named_endpoints", {}):
+                        _thread_local.api_version = "1.5"
+                    else:
+                        _thread_local.api_version = "2.0"
+                except Exception:
+                    _thread_local.api_version = "1.5"
+                _log("CONNECT", f"[{thread_name}] 连接成功！接口协议: v{_thread_local.api_version}")
             except Exception as e:
                 _log("CONNECT", f"[{thread_name}] 无法连接到 Gradio 服务。错误: {e}")
                 raise e
         return _thread_local.client
+
+    @classmethod
+    def get_api_version(cls) -> str:
+        """返回当前线程缓存的 API 版本，未连接时默认 '1.5'"""
+        return getattr(_thread_local, "api_version", "1.5")
 
 
 def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float) -> Optional[str]:
@@ -57,13 +71,45 @@ def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float) -> Opti
 
     try:
         client = TTSClient.get_client()
-        result = client.predict(
-            prompt=file(ref_audio_path), text=gen_text, infer_mode='普通推理',
-            max_text_tokens_per_sentence=120, sentences_bucket_max_size=4, param_5=True,
-            param_6=0.8, param_7=30, param_8=speed, param_9=0.0, param_10=3,
-            param_11=10.0, param_12=600, api_name="/gen_single"
-        )
-        return result["value"] if result else None
+        version = TTSClient.get_api_version()
+
+        if version == "1.5":
+            result = client.predict(
+                prompt=file(ref_audio_path), text=gen_text, infer_mode='普通推理',
+                max_text_tokens_per_sentence=120, sentences_bucket_max_size=4, param_5=True,
+                param_6=0.8, param_7=30, param_8=speed, param_9=0.0, param_10=3,
+                param_11=10.0, param_12=600, api_name="/gen_single"
+            )
+            if isinstance(result, dict):
+                return result.get("value")
+            return None
+        else:
+            # v2.0: speed 由下游 rubberband 后处理对齐，此处不传入
+            result = client.predict(
+                "Same as the voice reference",   # [0] emo_control_method
+                file(ref_audio_path),            # [1] prompt
+                gen_text,                        # [2] text
+                file(ref_audio_path),            # [3] emo_ref_path
+                0.65,                            # [4] emo_weight
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # [5]-[12] vec1~vec8
+                "",                              # [13] emo_text
+                False,                           # [14] emo_random
+                120.0,                           # [15] max_text_tokens_per_segment
+                True,                            # [16] do_sample
+                0.8,                             # [17] top_p
+                30.0,                            # [18] top_k
+                0.8,                             # [19] temperature
+                0.0,                             # [20] length_penalty
+                3.0,                             # [21] num_beams
+                10.0,                            # [22] repetition_penalty
+                1500.0,                          # [23] max_mel_tokens
+                api_name="/predict"
+            )
+            if result is None:
+                return None
+            if isinstance(result, dict):
+                return result.get("name")
+            return result
     except Exception as e:
         _log("API_ERR", f"API 调用失败: {e}")
         return None
