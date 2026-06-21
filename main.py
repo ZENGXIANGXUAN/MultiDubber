@@ -4,7 +4,8 @@ import shutil
 import hashlib
 import threading
 import time
-from typing import List, Optional, Dict
+import gc  # 引入垃圾回收机制
+from typing import List, Optional, Dict, Union
 from tqdm import tqdm
 from pydub import AudioSegment
 import subprocess
@@ -81,7 +82,7 @@ def post_process_audio_task(index: int, raw_generated_path: str, applied_speed: 
         return index
 
 
-def tts_generation_task(index: int, subtitle: List, main_reference_audio: str, current_tmp_dir: str):
+def tts_generation_task(index: int, subtitle: List, main_reference_audio: Union[str, AudioSegment], current_tmp_dir: str):
     start_time, end_time, raw_text, _ = subtitle
     text = preprocess_text(raw_text)
     if not text: return None, 0, text, 0
@@ -104,7 +105,7 @@ def tts_generation_task(index: int, subtitle: List, main_reference_audio: str, c
     return raw_generated_path, applied_speed, text, target_duration_s
 
 
-def _prepare_tts_params(index: int, subtitle: List, main_reference_audio: str,
+def _prepare_tts_params(index: int, subtitle: List, main_reference_audio: Union[str, AudioSegment],
                         current_tmp_dir: str, last_valid_ref_path: str = None) -> Optional[dict]:
     """
     预处理字幕，导出参考音频片段，返回 API 调用所需参数。
