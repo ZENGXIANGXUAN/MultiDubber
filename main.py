@@ -561,12 +561,16 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
 
                 # run_feeder 在当前线程阻塞运行，内部 put() 受有界队列控制
                 # Worker 消费一个 → 空出一个位 → 立刻喂入下一个
-                dispatcher.run_feeder(
-                    task_iter=task_iterator(),
-                    post_process_fn=post_process_fn,
-                    done_callback=done_callback,
-                    abort_flag_fn=lambda: config.ABORT_ALL,
-                )
+                gen = task_iterator()
+                try:
+                    dispatcher.run_feeder(
+                        task_iter=gen,
+                        post_process_fn=post_process_fn,
+                        done_callback=done_callback,
+                        abort_flag_fn=lambda: config.ABORT_ALL,
+                    )
+                finally:
+                    gen.close()
                 dispatcher.stop()
 
             # ════════════════════════════════════════
