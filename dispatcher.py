@@ -116,10 +116,16 @@ def _call_api_on_server(url: str, ref_audio_path: str,
             elapsed = time.time() - t0
             if DEBUG_DISPATCHER:
                 _log("API_DONE", f"{label} (v1.5) | 耗时 {elapsed:.2f}s")
-            return result["value"] if result else None
+            # 【修复 I3】使用 isinstance + .get 规避非预期 dict 导致的 KeyError 风险
+            if isinstance(result, dict):
+                return result.get("value")
+            return None
 
         # ═════════════════ 分支 2：2.0 新版本接口路由 ═════════════════
         else:
+            # 【修复 I1 设计决议】2.0 拓扑原生移除了前端 speed 控件。
+            # 下游 main.py 已常驻 rubberband 后处理做时长拉伸对齐，故安全忽略 speed。
+            # param_19 保持默认温度 0.8，拒绝向温度灌入语速浮点数以防音频崩坏。
             result = client.predict(
                 "Same as the voice reference",   # [0] emo_control_method (默认跟随音频)
                 gradio_file(ref_audio_path),     # [1] prompt (参考音频)
