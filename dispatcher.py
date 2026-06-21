@@ -58,10 +58,11 @@ def invalidate_client(url: str):
 
 
 # ──────────────────────────────────────────────
-# GPU 调用（含超时计时日志）
+# GPU 调用（含超时计时日志 & 1.5/2.0 版本路由分流）
 # ──────────────────────────────────────────────
 def _call_api_on_server(url: str, ref_audio_path: str,
                         gen_text: str, speed: float,
+                        version: str = "1.5",  # ✨ 新增参数：由调度 Worker 显式下发
                         task_id=None, queue_size="?") -> Optional[str]:
     if not os.path.exists(ref_audio_path):
         _log("API_ERR", f"Task {task_id} 参考音频不存在: {ref_audio_path}")
@@ -88,31 +89,65 @@ def _call_api_on_server(url: str, ref_audio_path: str,
 
     t0 = time.time()
     if DEBUG_DISPATCHER:
-        _log("API_START", f"{label} | text_len={len(gen_text)} speed={speed}")
+        _log("API_START", f"{label} | version={version} text_len={len(gen_text)} speed={speed}")
     watcher.start()
 
     try:
         client = _get_client(url)
-        result = client.predict(
-            prompt=gradio_file(ref_audio_path),
-            text=gen_text,
-            infer_mode='普通推理',
-            max_text_tokens_per_sentence=120,
-            sentences_bucket_max_size=4,
-            param_5=True,
-            param_6=0.8,
-            param_7=30,
-            param_8=speed,
-            param_9=0.0,
-            param_10=3,
-            param_11=10.0,
-            param_12=600,
-            api_name="/gen_single"
-        )
-        elapsed = time.time() - t0
-        if DEBUG_DISPATCHER:
-            _log("API_DONE", f"{label} | 耗时 {elapsed:.2f}s")
-        return result["value"] if result else None
+
+        # ═════════════════ 分支 1：1.5 老版本接口路由 ═════════════════
+        if version == "1.5":
+            result = client.predict(
+                prompt=gradio_file(ref_audio_path),
+                text=gen_text,
+                infer_mode='普通推理',
+                max_text_tokens_per_sentence=120,
+                sentences_bucket_max_size=4,
+                param_5=True,
+                param_6=0.8,
+                param_7=30,
+                param_8=speed,  # 1.5 版本的语速控制线
+                param_9=0.0,
+                param_10=3,
+                param_11=10.0,
+                param_12=600,
+                api_name="/gen_single"
+            )
+            elapsed = time.time() - t0
+            if DEBUG_DISPATCHER:
+                _log("API_DONE", f"{label} (v1.5) | 耗时 {elapsed:.2f}s")
+            return result["value"] if result else None
+
+        # ═════════════════ 分支 2：2.0 新版本接口路由 ═════════════════
+        else:
+            result = client.predict(
+                "Same as the voice reference",   # [0] emo_control_method (默认跟随音频)
+                gradio_file(ref_audio_path),     # [1] prompt (参考音频)
+                gen_text,                        # [2] text (目标文本)
+                gradio_file(ref_audio_path),     # [3] emo_ref_path (情感参考音频占位)
+                0.65,                            # [4] emo_weight
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, # [5]-[12] vec1~vec8 (情感向量滑块默认清零)
+                "",                              # [13] emo_text (情感描述文本为空)
+                False,                           # [14] emo_random (关闭随机采样)
+                120.0,                           # [15] max_text_tokens_per_segment
+                True,                            # [16] param_16 (do_sample)
+                0.8,                             # [17] param_17 (top_p)
+                30.0,                            # [18] param_18 (top_k)
+                0.8,                             # [19] param_19 (temperature)
+                0.0,                             # [20] param_20 (length_penalty)
+                3.0,                             # [21] param_21 (num_beams)
+                10.0,                            # [22] param_22 (repetition_penalty)
+                1500.0,                          # [23] param_23 (max_mel_tokens)
+                api_name="/predict"              # v2.0 默认预测路由
+            )
+            elapsed = time.time() - t0
+            if DEBUG_DISPATCHER:
+                _log("API_DONE", f"{label} (v2.0) | 耗时 {elapsed:.2f}s")
+
+            # v2.0 的 Gradio 如果返回了 File 字典，安全解出本地路径路径字符串
+            if isinstance(result, dict) and "name" in result:
+                return result["name"]
+            return result
 
     except Exception as e:
         elapsed = time.time() - t0
@@ -196,7 +231,27 @@ class MultiServerDispatcher:
         self._all_done_event  = threading.Event()
         self._abort_event     = threading.Event()
 
+        # ✨ 新增：静态服务器版本缓存字典 (URL -> "1.5" 或 "2.0")
+        self.server_versions: Dict[str, str] = {}
+
     def start(self):
+        # ─── ✨ 核心优化：在多线程 Worker 启动前，对所有配置的节点进行静态测试与接口打标 ───
+        _log("INIT", "📡 正在对集群节点进行连通性测试与接口版本嗅探...")
+        for url in self.server_configs.keys():
+            try:
+                cli = _get_client(url)
+                api_info = cli.api_info()
+
+                if "/gen_single" in api_info.get("named_endpoints", {}):
+                    self.server_versions[url] = "1.5"
+                else:
+                    self.server_versions[url] = "2.0"
+                _log("INIT", f"✅ 节点连通测试成功: {url} | 成功识别接口协议: {self.server_versions[url]}")
+            except Exception as e:
+                self.server_versions[url] = "1.5"
+                _log("WARN", f"⚠️ 节点握手失败: {url} ({e})，协议安全临时降级为 1.5")
+
+        # ─── 顺理成章地继续启动你原本的多线程 Worker ───
         total = 0
         for url, n in self.server_configs.items():
             for i in range(n):
@@ -219,11 +274,10 @@ class MultiServerDispatcher:
             t.start()
             self._cpu_worker_threads.append(t)
 
-        cfg = ", ".join(f"{u.rstrip('/').split(':')[-1]}×{n}"
+        cfg = ", ".join(f"{u.rstrip('/').split(':')[-1]}×{n}({self.server_versions.get(u, '1.5')})"
                         for u, n in self.server_configs.items())
-        _log("INIT", f"启动: GPU({cfg}) 共{total}线程 | "
-                     f"CPU {self.cpu_workers}线程 | 队列容量 {self._gpu_queue.maxsize} | "
-                     f"任务最大重试 {self.max_retries} 次")
+        _log("INIT", f"启动完成: GPU集群({cfg}) 共{total}线程 | "
+                     f"CPU {self.cpu_workers}线程 | 队列容量 {self._gpu_queue.maxsize}")
 
     def run_feeder(self,
                    task_iter: Iterable[Tuple],
@@ -358,8 +412,13 @@ class MultiServerDispatcher:
             success  = False
             try:
                 q_depth = self._gpu_queue.qsize()
+
+                # ✨ 核心重构：直接从初始化时探测好的注册表中取出该服务器对应的静态版本，传递给分发引擎
+                srv_version = self.server_versions.get(url, "1.5")
+
                 raw_path = _call_api_on_server(
                     url, task.ref_audio_path, task.gen_text, task.speed,
+                    version=srv_version,  # ✨ 注入版本参数
                     task_id=task.task_id, queue_size=q_depth
                 )
                 success = raw_path is not None
