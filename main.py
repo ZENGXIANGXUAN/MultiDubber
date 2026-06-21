@@ -524,30 +524,40 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                     last_valid_ref_path = _recover_last_ref(
                         current_tmp_dir, uncompleted_indices, log
                     )
-                    for index in uncompleted_indices:
-                        if config.ABORT_ALL:
-                            return
 
-                        params = _prepare_tts_params(
-                            index, parsed_subtitles[index],
-                            main_audio_path, current_tmp_dir,
-                            last_valid_ref_path=last_valid_ref_path
-                        )
+                    # [OOM防护]：仅在此处一次性载入大文件，避免 I/O 阻塞
+                    try:
+                        log("正在将参考主音频载入内存...")
+                        loaded_main_audio = AudioSegment.from_file(main_audio_path)
+                    except Exception as e:
+                        log(f"内存载入失败，回退至硬盘直读模式: {e}")
+                        loaded_main_audio = main_audio_path
 
-                        if params is None:
-                            # 文本为空或无可复用音频，直接标记为完成
-                            with status_lock:
-                                completed_indices.add(index)
-                            continue
+                    try:
+                        for index in uncompleted_indices:
+                            if config.ABORT_ALL:
+                                return
 
-                        # 更新最后一次健康的音频路径，以便下个可能短促的任务复用
-                        last_valid_ref_path = params["ref_audio_path"]
-                        task_params_map[index] = params
+                            params = _prepare_tts_params(
+                                index, parsed_subtitles[index],
+                                loaded_main_audio, current_tmp_dir,
+                                last_valid_ref_path=last_valid_ref_path
+                            )
+                            if params is None:
+                                with status_lock:
+                                    completed_indices.add(index)
+                                continue
 
-                        yield (index,
-                               params["ref_audio_path"],
-                               params["text"],
-                               params["speed"])
+                            last_valid_ref_path = params["ref_audio_path"]
+                            task_params_map[index] = params
+
+                            yield (index, params["ref_audio_path"], params["text"], params["speed"])
+                    finally:
+                        # [OOM防护]：生成器执行完毕（切片任务入队完成）后，强制释放大内存
+                        if 'loaded_main_audio' in locals() and isinstance(loaded_main_audio, AudioSegment):
+                            del loaded_main_audio
+                            gc.collect()
+                            log("已释放内存中的主音频对象。")
 
                 # run_feeder 在当前线程阻塞运行，内部 put() 受有界队列控制
                 # Worker 消费一个 → 空出一个位 → 立刻喂入下一个
