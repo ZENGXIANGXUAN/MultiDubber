@@ -421,6 +421,15 @@ class MultiServerDispatcher:
     def _gpu_worker_loop(self, url: str):
         worker_name = threading.current_thread().name
 
+        # ── Worker 启动时重连：清除本线程可能缓存的死连接 ──
+        # run_feeder() 的探测仅作用于主线程，Worker 线程各自有独立的
+        # _thread_local.client_cache，需要在本线程内清除并重新握手。
+        invalidate_client(url)
+        try:
+            _get_client(url)
+        except Exception:
+            pass  # 首个任务的 _call_api_on_server 会触发重试并记录错误
+
         while True:
             with self._server_lock:
                 is_down = url not in self._active_servers
