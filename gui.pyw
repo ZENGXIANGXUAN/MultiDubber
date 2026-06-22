@@ -806,32 +806,42 @@ class TTSApp(QWidget):
 
     def _parse_server_urls(self, raw: str) -> list[str]:
         """
-        解析输入，支持批量语法 ~N：
+        解析输入，支持逗号分隔多链接 + 每段独立的 ~N 批量语法：
+          http://a:7860/, http://b:7860/       →  2个
+          http://a:7860~2/, http://b:7860~1/   →  5个 (3+2)
+        """
+        parts = [p.strip() for p in raw.split(',') if p.strip()]
+        all_urls = []
+        for part in parts:
+            all_urls.extend(self._parse_single_url(part))
+        return all_urls
+
+    def _parse_single_url(self, raw: str) -> list[str]:
+        """
+        解析单个 URL，支持批量语法 ~N：
           http://127.0.0.1:7860~2/  →  7860, 7861, 7862 共3个
           http://127.0.0.1:7860/    →  仅 7860
         ~N 中的 N 表示额外再添加几个（总数 = N+1）。
         """
         import re
-        # 匹配 ~数字，允许出现在端口后、路径前任意位置
         m = re.search(r'~(\d+)', raw)
         if not m:
             url = raw if raw.endswith('/') else raw + '/'
             return [url]
 
         extra = int(m.group(1))
-        base = raw[:m.start()] + raw[m.end():]  # 去掉 ~N 部分
+        base = raw[:m.start()] + raw[m.end():]
         if not base.endswith('/'):
             base += '/'
 
-        # 提取端口号
         port_m = re.search(r':(\d+)/', base)
         if not port_m:
             self.append_log("⚠️ 无法解析端口号，请确保 URL 格式为 http://host:port/")
             return [base]
 
         base_port = int(port_m.group(1))
-        prefix = base[:port_m.start(1)]  # "http://127.0.0.1:"
-        suffix = base[port_m.end(1):]  # "/"
+        prefix = base[:port_m.start(1)]
+        suffix = base[port_m.end(1):]
 
         urls = []
         for i in range(extra + 1):
