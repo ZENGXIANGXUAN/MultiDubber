@@ -89,7 +89,9 @@ def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float) -> Opti
                 param_11=10.0, param_12=600, api_name="/gen_single"
             )
             if isinstance(result, dict):
-                return result.get("value")
+                return result.get("value") or result.get("path") or result.get("url")
+            if isinstance(result, str):
+                return result
             return None
         else:
             # v2.0: speed 由下游 rubberband 后处理对齐，此处不传入
@@ -117,8 +119,11 @@ def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float) -> Opti
             if result is None:
                 return None
             if isinstance(result, dict):
-                return result.get("name")
-            return result
+                # Gradio FileData 字典：key 优先级 path > url > name
+                return result.get("path") or result.get("url") or result.get("name")
+            if isinstance(result, str):
+                return result  # 新版 gradio_client 可能直接返回路径字符串
+            return None
     except Exception as e:
         _log("API_ERR", f"API 调用失败: {e}")
         return None
