@@ -336,6 +336,28 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
     global_file_idx = 0
     processed_basenames = set()
 
+    # ── 多服务器模式：全局初始化调度器（生命周期覆盖所有文件）──
+    dispatcher = None
+    if use_multi_server:
+        def _on_server_down(url, stats):
+            log(f"⚠️ 服务器下线: {url} | {stats}")
+            if on_server_down:
+                on_server_down(url, stats)
+
+        def _on_all_down():
+            log("🛑 所有服务器均已熔断，停止程序！")
+            setattr(config, 'ABORT_ALL', True)
+            if on_all_down:
+                on_all_down()
+
+        dispatcher = MultiServerDispatcher(
+            server_configs=server_configs,
+            max_retries=max_retries if max_retries is not None else config.MAX_RETRIES,
+            on_server_down=_on_server_down,
+            on_all_down=_on_all_down,
+        )
+        dispatcher.start()
+
     for srt_path, srt_file in all_folder_files:
         if config.ABORT_ALL:
             log("!!! 任务已由用户强制终止 !!!")
@@ -453,25 +475,6 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
             if use_multi_server:
                 log(f"--- [多服务器] 剩余 {len(uncompleted_indices)} 个任务，需求驱动分发 ---")
 
-                def _on_server_down(url, stats):
-                    log(f"⚠️ 服务器下线: {url} | {stats}")
-                    if on_server_down:
-                        on_server_down(url, stats)
-
-                def _on_all_down():
-                    log("🛑 所有服务器均已熔断，停止程序！")
-                    setattr(config, 'ABORT_ALL', True)
-                    if on_all_down:
-                        on_all_down()
-
-                dispatcher = MultiServerDispatcher(
-                    server_configs=server_configs,
-                    max_retries=max_retries if max_retries is not None else config.MAX_RETRIES,
-                    on_server_down=_on_server_down,
-                    on_all_down=_on_all_down,
-                )
-                dispatcher.start()
-
                 completed_count = len(completed_indices)
                 file_start_time = time.time()
                 session_processed_count = 0
@@ -571,7 +574,6 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                     )
                 finally:
                     gen.close()
-                dispatcher.stop()
 
             # ════════════════════════════════════════
             # 单服务器模式（原有逻辑，完整保留）
@@ -677,6 +679,10 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                 os.rmdir(ref_ap)
             except Exception:
                 pass
+
+    # ── 全局关闭调度器 ──
+    if dispatcher:
+        dispatcher.stop()
 
 
 if __name__ == '__main__':
