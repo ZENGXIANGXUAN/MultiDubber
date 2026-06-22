@@ -34,6 +34,7 @@ SLOW_API_THRESHOLD_S  = 45.0   # API 超过此时长打印 API_SLOW 警告 (放�
 HANG_API_THRESHOLD_S  = 120.0  # API 超过此时长打印 API_HANG 警告（疑似卡死）
 IDLE_WARN_THRESHOLD_S = 15.0   # Worker 空闲等待超过此时长打印 WORKER_IDLE 警告
 SLOW_CPU_THRESHOLD_S  = 5.0    # CPU 后处理超过此时长打印 CPU_SLOW 警告
+RECONNECT_IDLE_S      = 60.0   # Worker 空闲超过此时长后取到任务，先重连再调用
 
 # ──────────────────────────────────────────────
 # 服务器连接缓存 (线程独立存储，避免并发冲突)
@@ -421,14 +422,7 @@ class MultiServerDispatcher:
     def _gpu_worker_loop(self, url: str):
         worker_name = threading.current_thread().name
 
-        # ── Worker 启动时重连：清除本线程可能缓存的死连接 ──
-        # run_feeder() 的探测仅作用于主线程，Worker 线程各自有独立的
-        # _thread_local.client_cache，需要在本线程内清除并重新握手。
-        invalidate_client(url)
-        try:
-            _get_client(url)
-        except Exception:
-            pass  # 首个任务的 _call_api_on_server 会触发重试并记录错误
+        last_success_time = time.time()
 
         while True:
             with self._server_lock:
@@ -452,6 +446,17 @@ class MultiServerDispatcher:
                     _log("QUEUE_WAIT", f"Task {task.task_id} 排队等待了 {queue_wait_s:.2f}s")
                 _log("WORKER_PICK", f"{worker_name} 取出 Task {task.task_id} (retry={task.retry_count})")
 
+            # ── 空闲过久，本线程连接可能已被 Cloudflare 踢掉，主动重置 ──
+            idle_s = time.time() - last_success_time
+            if idle_s > RECONNECT_IDLE_S:
+                if DEBUG_DISPATCHER:
+                    _log("RECONNECT", f"{worker_name} 空闲 {idle_s:.1f}s，取任务前重连 {url}")
+                invalidate_client(url)
+                try:
+                    _get_client(url)
+                except Exception:
+                    pass  # 连接失败交给后续 _call_api_on_server 的重试机制处理
+
             raw_path = None
             success  = False
             try:
@@ -471,6 +476,7 @@ class MultiServerDispatcher:
                 success = False
             finally:
                 if success:
+                    last_success_time = time.time()
                     self._cpu_queue.put(_CpuTask(
                         task.task_id, raw_path, url,
                         task.post_process_fn, task.done_callback
