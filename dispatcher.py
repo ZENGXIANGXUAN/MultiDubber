@@ -309,6 +309,19 @@ class MultiServerDispatcher:
             self._all_done_event.clear()  # 清除上一个文件的完成事件信号
             self._total_submitted = float('inf')
 
+        # ── 分发前重连：清除死连接缓存并重新握手 ──
+        # start() 到 run_feeder() 之间可能间隔数分钟，Cloudflare/Gradio Live
+        # 会在空闲 60-90 秒后踢掉连接，导致首批任务集中失败。
+        # 此处对所有活跃节点逐一清除缓存并重新握手，确保分发时连接是新鲜的。
+        _log("INIT", "🔄 分发前重新探测所有节点连接...")
+        for url in list(self._active_servers):
+            invalidate_client(url)
+            try:
+                _get_client(url)
+                _log("INIT", f"✅ 节点重连成功: {url}")
+            except Exception as e:
+                _log("WARN", f"⚠️ 节点重连失败: {url} ({e})，首个任务将触发重试。")
+
         submitted = 0
         for task_id, ref_audio_path, gen_text, speed in task_iter:
             if abort_flag_fn() or self._abort_event.is_set():
