@@ -124,7 +124,9 @@ def _call_api_on_server(url: str, ref_audio_path: str,
                 _log("API_DONE", f"{label} (v1.5) | 耗时 {elapsed:.2f}s")
             # 【修复 I3】使用 isinstance + .get 规避非预期 dict 导致的 KeyError 风险
             if isinstance(result, dict):
-                return result.get("value")
+                return result.get("value") or result.get("path") or result.get("url")
+            if isinstance(result, str):
+                return result
             return None
 
         # ═════════════════ 分支 2：2.0 新版本接口路由 ═════════════════
@@ -158,8 +160,11 @@ def _call_api_on_server(url: str, ref_audio_path: str,
             if result is None:
                 return None
             if isinstance(result, dict):
-                return result.get("name")  # File dict → 路径字符串，无 "name" 则返回 None
-            return result
+                # Gradio FileData 字典：key 优先级 path > url > name
+                return result.get("path") or result.get("url") or result.get("name")
+            if isinstance(result, str):
+                return result  # 新版 gradio_client 可能直接返回路径字符串
+            return None
 
     except Exception as e:
         elapsed = time.time() - t0
