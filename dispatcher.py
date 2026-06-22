@@ -300,6 +300,8 @@ class MultiServerDispatcher:
                    done_callback: Callable,
                    abort_flag_fn: Callable[[], bool]):
         with self._done_lock:
+            self._total_done = 0          # 重置已完成计数
+            self._all_done_event.clear()  # 清除上一个文件的完成事件信号
             self._total_submitted = float('inf')
 
         submitted = 0
