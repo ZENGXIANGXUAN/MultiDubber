@@ -44,5 +44,8 @@ Thumbs.db
 *.log
 logs/
 
+# Local isolated worktrees
+.worktrees/
+
 # User settings
 app_settings.json
