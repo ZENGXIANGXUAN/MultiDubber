@@ -8,7 +8,8 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QTextEdit, QFileDialog, QLabel, QLineEdit, QHBoxLayout,
                              QGroupBox, QProgressBar, QStyleFactory, QListWidget,
                              QListWidgetItem, QAbstractItemView, QSystemTrayIcon, QMenu,
-                             QDialog, QFormLayout, QDialogButtonBox, QSpinBox, QMessageBox)
+                             QDialog, QFormLayout, QDialogButtonBox, QSpinBox, QMessageBox,
+                             QCheckBox)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QObject, QTimer
 from PyQt6.QtGui import QPalette, QColor, QIcon, QPixmap, QPainter, QBrush, QCursor
 import config
@@ -27,8 +28,8 @@ SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_se
 DEFAULT_SETTINGS = {
     "srt_paths": [],
     "line_index": 2,
-    "total_threads": 6,
-    "max_retries": 3,
+    "max_retries": 5,
+    "circuit_breaker_threshold": 6,
     "webhook_url": "https://sctapi.ftqq.com/SCT124090TODYAymp8nuHDeqleLu8oRDAS.send",
     "servers": [],
     "api_public_key": "",  # 新增：公钥
@@ -45,6 +46,8 @@ def load_settings() -> dict:
             # 补全缺失的键
             for k, v in DEFAULT_SETTINGS.items():
                 data.setdefault(k, v)
+            # 旧版本按总线程数均分服务器；现在每台在线服务器固定 2 线程
+            data.pop("total_threads", None)
             # migrate old single-path setting
             if not data.get("srt_paths") and data.get("srt_path"):
                 data["srt_paths"] = [data["srt_path"]]
@@ -114,8 +117,8 @@ def _play_sound(sound_type: str):
 class SettingsDialog(QDialog):
     def __init__(self, parent=None,
                  line_index: int = 2,
-                 total_threads: int = 6,
-                 max_retries: int = 3,
+                 max_retries: int = 5,
+                 circuit_breaker_threshold: int = 6,
                  webhook_url: str = "",
                  api_public_key: str = "",
                  api_private_key: str = "",
@@ -154,17 +157,10 @@ class SettingsDialog(QDialog):
         )
         form.addRow("合并字数上限:", self.spin_merge_chars)
 
-        # Total Threads
-        self.spin_threads = QSpinBox()
-        self.spin_threads.setRange(1, 128)
-        self.spin_threads.setValue(total_threads)
-        self.spin_threads.setMinimumHeight(32)
-        self.spin_threads.setToolTip("所有服务器的线程总数，均分给各服务器")
-        form.addRow("总线程数:", self.spin_threads)
-
         # Max Retries
         self.spin_retries = QSpinBox()
-        self.spin_retries.setRange(1, 20)
+        self.spin_retries.setMinimum(1)
+        self.spin_retries.setMaximum(2147483647)
         self.spin_retries.setValue(max_retries)
         self.spin_retries.setMinimumHeight(32)
         self.spin_retries.setToolTip(
@@ -172,6 +168,17 @@ class SettingsDialog(QDialog):
             "同时：某台服务器连续失败达到此次数后将自动下线。"
         )
         form.addRow("最大重试次数:", self.spin_retries)
+
+        # Circuit Breaker Threshold
+        self.spin_cb_threshold = QSpinBox()
+        self.spin_cb_threshold.setRange(2, 50)
+        self.spin_cb_threshold.setValue(circuit_breaker_threshold)
+        self.spin_cb_threshold.setMinimumHeight(32)
+        self.spin_cb_threshold.setToolTip(
+            "服务器熔断阈值：连续无效重连达到此次数后，服务器自动下线。\n"
+            "Cloudflare 穿透环境下建议设为 6+，避免网络抖动导致误判。"
+        )
+        form.addRow("熔断阈值:", self.spin_cb_threshold)
 
         # Webhook URL
         self.webhook_input = QLineEdit(webhook_url)
@@ -237,12 +244,12 @@ class SettingsDialog(QDialog):
         return self.spin_line.value()
 
     @property
-    def total_threads(self) -> int:
-        return self.spin_threads.value()
-
-    @property
     def max_retries(self) -> int:
         return self.spin_retries.value()
+
+    @property
+    def circuit_breaker_threshold(self) -> int:
+        return self.spin_cb_threshold.value()
 
     @property
     def webhook_url(self) -> str:
@@ -316,19 +323,21 @@ class WorkerThread(QThread):
     finished_signal = pyqtSignal(bool)
 
     def __init__(self, srt_paths, transformers_line, adapter, server_configs: dict,
-                 max_retries: int = 3):
+                 max_retries: int = 5, circuit_breaker_threshold: int = 6):
         super().__init__()
         self.srt_paths = srt_paths
         self.transformers_line = transformers_line
         self.adapter = adapter
         self.server_configs = server_configs
         self.max_retries = max_retries
+        self.circuit_breaker_threshold = circuit_breaker_threshold
 
     def run(self):
         config.USE_TQDM_PROGRESS_BAR = False
         config.ABORT_ALL = False
+        completed = False
         try:
-            process_srt_files(
+            completed = process_srt_files(
                 srt_paths=self.srt_paths,
                 transformers_line=self.transformers_line,
                 progress_callback=self.adapter,
@@ -336,11 +345,12 @@ class WorkerThread(QThread):
                 on_server_down=self.adapter.notify_server_down,
                 on_all_down=self.adapter.notify_all_down,
                 max_retries=self.max_retries,
+                circuit_breaker_threshold=self.circuit_breaker_threshold,
             )
         except Exception as e:
             self.adapter.log(f"Critical Error in Worker: {e}")
         finally:
-            self.finished_signal.emit(not config.ABORT_ALL)
+            self.finished_signal.emit(bool(completed) and not config.ABORT_ALL)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -540,18 +550,18 @@ class TTSApp(QWidget):
 
         self._folder_widgets: dict = {}
 
-        # 只读摘要行（Line Index & 总线程数，点 Settings 才能改）
+        # 只读摘要行（点 Settings 才能改）
         summary_layout = QHBoxLayout()
         self.lbl_line_summary = QLabel(f"Line Index: {self._settings['line_index']}")
-        self.lbl_thread_summary = QLabel(f"总线程数: {self._settings['total_threads']}")
-        self.lbl_retry_summary = QLabel(f"最大重试: {self._settings.get('max_retries', 3)}")
+        self.lbl_retry_summary = QLabel(f"最大重试: {self._settings.get('max_retries', 5)}")
+        self.lbl_cb_summary = QLabel(f"熔断阈值: {self._settings.get('circuit_breaker_threshold', 6)}")
         self.lbl_merge_summary = QLabel(f"合并字数: {self._settings.get('merge_max_chars', 30)}")
         self.lbl_webhook_summary = QLabel()
         self._refresh_summary_labels()
 
-        for lbl in (self.lbl_line_summary, self.lbl_thread_summary,
-                    self.lbl_retry_summary, self.lbl_merge_summary,
-                    self.lbl_webhook_summary):
+        for lbl in (self.lbl_line_summary, self.lbl_retry_summary,
+                    self.lbl_cb_summary,
+                    self.lbl_merge_summary, self.lbl_webhook_summary):
             lbl.setStyleSheet("color: #aaa; font-size: 12px;")
 
         hint_btn = QPushButton("⚙️ 修改")
@@ -564,9 +574,9 @@ class TTSApp(QWidget):
 
         summary_layout.addWidget(self.lbl_line_summary)
         summary_layout.addSpacing(20)
-        summary_layout.addWidget(self.lbl_thread_summary)
-        summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_retry_summary)
+        summary_layout.addSpacing(20)
+        summary_layout.addWidget(self.lbl_cb_summary)
         summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_merge_summary)
         summary_layout.addSpacing(20)
@@ -669,8 +679,8 @@ class TTSApp(QWidget):
         dlg = SettingsDialog(
             parent=self,
             line_index=self._settings["line_index"],
-            total_threads=self._settings["total_threads"],
-            max_retries=self._settings.get("max_retries", 3),
+            max_retries=self._settings.get("max_retries", 5),
+            circuit_breaker_threshold=self._settings.get("circuit_breaker_threshold", 6),
             webhook_url=self._settings.get("webhook_url", ""),
             api_public_key=self._settings.get("api_public_key", ""),
             api_private_key=self._settings.get("api_private_key", ""),
@@ -681,8 +691,8 @@ class TTSApp(QWidget):
         dlg.setStyleSheet(self.styleSheet())
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._settings["line_index"] = dlg.line_index
-            self._settings["total_threads"] = dlg.total_threads
             self._settings["max_retries"] = dlg.max_retries
+            self._settings["circuit_breaker_threshold"] = dlg.circuit_breaker_threshold
             self._settings["webhook_url"] = dlg.webhook_url
 
             # 接收新参数并保存
@@ -693,22 +703,23 @@ class TTSApp(QWidget):
 
             # 同步到 config 模块
             config.MERGE_MAX_CHARS = dlg.merge_max_chars
+            config.CIRCUIT_BREAKER_THRESHOLD = dlg.circuit_breaker_threshold
 
             self._save_current_settings()
             self._refresh_summary_labels()
             self._update_thread_hints()
             self.append_log(
                 f"> Settings saved — Line Index: {dlg.line_index}, "
-                f"总线程数: {dlg.total_threads}, "
                 f"最大重试: {dlg.max_retries}, "
+                f"熔断阈值: {dlg.circuit_breaker_threshold}, "
                 f"合并字数上限: {dlg.merge_max_chars}, "
                 f"Webhook: {'已设置' if dlg.webhook_url else '未设置'}"
             )
 
     def _refresh_summary_labels(self):
         self.lbl_line_summary.setText(f"Line Index: {self._settings['line_index']}")
-        self.lbl_thread_summary.setText(f"总线程数: {self._settings['total_threads']}")
-        self.lbl_retry_summary.setText(f"最大重试: {self._settings.get('max_retries', 3)}")
+        self.lbl_retry_summary.setText(f"最大重试: {self._settings.get('max_retries', 5)}")
+        self.lbl_cb_summary.setText(f"熔断阈值: {self._settings.get('circuit_breaker_threshold', 6)}")
         self.lbl_merge_summary.setText(f"合并字数: {self._settings.get('merge_max_chars', 30)}")
         wh = self._settings.get("webhook_url", "")
         if wh:
@@ -751,35 +762,20 @@ class TTSApp(QWidget):
         self._update_thread_hints()
 
     def _update_thread_hints(self):
-        try:
-            total = max(1, self._settings["total_threads"])
-        except (KeyError, TypeError):
-            return
         online = [(url, entry) for url, (_, entry) in self._server_widgets.items()
                   if entry.status != 'offline']
-        n = len(online)
-        if n == 0:
-            return
-        base = total // n
-        remainder = total % n
-        for i, (url, entry) in enumerate(online):
-            entry.set_thread_hint(max(1, base + (remainder if i == 0 else 0)))
+        for url, entry in online:
+            entry.set_thread_hint(2)
         for url, (_, entry) in self._server_widgets.items():
             if entry.status == 'offline':
                 entry.set_thread_hint(0)
 
     def _get_server_configs(self) -> dict:
-        total = max(1, self._settings.get("total_threads", 6))
         online = [(url, entry) for url, (_, entry) in self._server_widgets.items()
                   if entry.status != 'offline']
-        n = len(online)
-        if n == 0:
-            return {}
-        base = total // n
-        remainder = total % n
         return {
-            url: max(1, base + (remainder if i == 0 else 0))
-            for i, (url, entry) in enumerate(online)
+            url: 2
+            for url, entry in online
         }
 
     def _update_run_btn(self):
@@ -1004,7 +1000,8 @@ class TTSApp(QWidget):
             transformers_line=line_idx,
             adapter=self.adapter,
             server_configs=server_configs,
-            max_retries=self._settings.get("max_retries", 3),
+            max_retries=self._settings.get("max_retries", 5),
+            circuit_breaker_threshold=self._settings.get("circuit_breaker_threshold", 6),
         )
         self.worker.finished_signal.connect(self.process_finished)
         self.worker.start()
