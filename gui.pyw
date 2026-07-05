@@ -364,6 +364,7 @@ class WorkerThread(QThread):
                 on_all_down=self.adapter.notify_all_down,
                 max_retries=self.max_retries,
                 circuit_breaker_threshold=self.circuit_breaker_threshold,
+                background_merge=self.background_merge,
             )
         except Exception as e:
             self.adapter.log(f"Critical Error in Worker: {e}")
