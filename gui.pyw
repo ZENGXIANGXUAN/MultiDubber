@@ -339,7 +339,8 @@ class WorkerThread(QThread):
     finished_signal = pyqtSignal(bool)
 
     def __init__(self, srt_paths, transformers_line, adapter, server_configs: dict,
-                 max_retries: int = 5, circuit_breaker_threshold: int = 6):
+                 max_retries: int = 5, circuit_breaker_threshold: int = 6,
+                 background_merge: bool = False):
         super().__init__()
         self.srt_paths = srt_paths
         self.transformers_line = transformers_line
@@ -347,6 +348,7 @@ class WorkerThread(QThread):
         self.server_configs = server_configs
         self.max_retries = max_retries
         self.circuit_breaker_threshold = circuit_breaker_threshold
+        self.background_merge = background_merge
 
     def run(self):
         config.USE_TQDM_PROGRESS_BAR = False
@@ -572,12 +574,14 @@ class TTSApp(QWidget):
         self.lbl_retry_summary = QLabel(f"最大重试: {self._settings.get('max_retries', 5)}")
         self.lbl_cb_summary = QLabel(f"熔断阈值: {self._settings.get('circuit_breaker_threshold', 6)}")
         self.lbl_merge_summary = QLabel(f"合并字数: {self._settings.get('merge_max_chars', 30)}")
+        self.lbl_bg_merge_summary = QLabel()
         self.lbl_webhook_summary = QLabel()
         self._refresh_summary_labels()
 
         for lbl in (self.lbl_line_summary, self.lbl_retry_summary,
                     self.lbl_cb_summary,
-                    self.lbl_merge_summary, self.lbl_webhook_summary):
+                    self.lbl_merge_summary, self.lbl_bg_merge_summary,
+                    self.lbl_webhook_summary):
             lbl.setStyleSheet("color: #aaa; font-size: 12px;")
 
         hint_btn = QPushButton("⚙️ 修改")
@@ -595,6 +599,8 @@ class TTSApp(QWidget):
         summary_layout.addWidget(self.lbl_cb_summary)
         summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_merge_summary)
+        summary_layout.addSpacing(20)
+        summary_layout.addWidget(self.lbl_bg_merge_summary)
         summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_webhook_summary)
         summary_layout.addStretch()
@@ -702,6 +708,7 @@ class TTSApp(QWidget):
             api_private_key=self._settings.get("api_private_key", ""),
             api_hostid=self._settings.get("api_hostid", ""),
             merge_max_chars=self._settings.get("merge_max_chars", 30),
+            background_merge=self._settings.get("background_merge", False),
         )
         # 应用暗色样式到对话框
         dlg.setStyleSheet(self.styleSheet())
@@ -716,6 +723,7 @@ class TTSApp(QWidget):
             self._settings["api_private_key"] = dlg.api_private_key
             self._settings["api_hostid"] = dlg.api_hostid
             self._settings["merge_max_chars"] = dlg.merge_max_chars
+            self._settings["background_merge"] = dlg.background_merge
 
             # 同步到 config 模块
             config.MERGE_MAX_CHARS = dlg.merge_max_chars
@@ -729,6 +737,7 @@ class TTSApp(QWidget):
                 f"最大重试: {dlg.max_retries}, "
                 f"熔断阈值: {dlg.circuit_breaker_threshold}, "
                 f"合并字数上限: {dlg.merge_max_chars}, "
+                f"后台合并: {'开' if dlg.background_merge else '关'}, "
                 f"Webhook: {'已设置' if dlg.webhook_url else '未设置'}"
             )
 
@@ -737,6 +746,8 @@ class TTSApp(QWidget):
         self.lbl_retry_summary.setText(f"最大重试: {self._settings.get('max_retries', 5)}")
         self.lbl_cb_summary.setText(f"熔断阈值: {self._settings.get('circuit_breaker_threshold', 6)}")
         self.lbl_merge_summary.setText(f"合并字数: {self._settings.get('merge_max_chars', 30)}")
+        bg = self._settings.get("background_merge", False)
+        self.lbl_bg_merge_summary.setText(f"后台合并: {'开' if bg else '关'}")
         wh = self._settings.get("webhook_url", "")
         if wh:
             # 只显示域名部分，避免泄露完整 key
@@ -1018,6 +1029,7 @@ class TTSApp(QWidget):
             server_configs=server_configs,
             max_retries=self._settings.get("max_retries", 5),
             circuit_breaker_threshold=self._settings.get("circuit_breaker_threshold", 6),
+            background_merge=self._settings.get("background_merge", False),
         )
         self.worker.finished_signal.connect(self.process_finished)
         self.worker.start()
