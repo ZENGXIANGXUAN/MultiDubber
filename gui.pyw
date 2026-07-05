@@ -124,7 +124,8 @@ class SettingsDialog(QDialog):
                  api_public_key: str = "",
                  api_private_key: str = "",
                  api_hostid: str = "",
-                 merge_max_chars: int = 30):
+                 merge_max_chars: int = 30,
+                 background_merge: bool = False):
         super().__init__(parent)
         self.setWindowTitle("⚙️  Settings")
         self.setMinimumWidth(500)
@@ -157,6 +158,15 @@ class SettingsDialog(QDialog):
             "设为 0 禁用合并功能。"
         )
         form.addRow("合并字数上限:", self.spin_merge_chars)
+
+        # Background Merge
+        self.chk_background_merge = QCheckBox("后台合并音视频")
+        self.chk_background_merge.setChecked(background_merge)
+        self.chk_background_merge.setToolTip(
+            "勾选后，音频合成完成后将在后台线程执行视频合并，\n"
+            "不阻塞主界面，可继续添加新任务。"
+        )
+        form.addRow("后台合并:", self.chk_background_merge)
 
         # Max Retries
         self.spin_retries = QSpinBox()
@@ -271,6 +281,10 @@ class SettingsDialog(QDialog):
     @property
     def merge_max_chars(self) -> int:
         return self.spin_merge_chars.value()
+
+    @property
+    def background_merge(self) -> bool:
+        return self.chk_background_merge.isChecked()
 
 
 # ══════════════════════════════════════════════════════════════
