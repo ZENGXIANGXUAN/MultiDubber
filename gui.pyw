@@ -36,6 +36,7 @@ DEFAULT_SETTINGS = {
     "api_private_key": "",  # 新增：私钥
     "api_hostid": "",  # 新增：Host ID
     "merge_max_chars": 30,  # 字幕合并字数上限，0=禁用
+    "background_merge": False,  # 后台合并音视频
 }
 
 
