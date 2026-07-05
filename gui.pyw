@@ -162,6 +162,7 @@ class SettingsDialog(QDialog):
         # Background Merge
         self.chk_background_merge = QCheckBox("后台合并音视频")
         self.chk_background_merge.setChecked(background_merge)
+        self.chk_background_merge.setMinimumHeight(32)
         self.chk_background_merge.setToolTip(
             "勾选后，音频合成完成后将在后台线程执行视频合并，\n"
             "不阻塞主界面，可继续添加新任务。"
