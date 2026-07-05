@@ -5,10 +5,11 @@ import hashlib
 import threading
 import time
 import gc  # 引入垃圾回收机制
-from typing import List, Optional, Dict, Union
+from typing import List, Optional, Dict, Union, Callable
 from tqdm import tqdm
 from pydub import AudioSegment
 import subprocess
+import concurrent.futures
 
 import config
 from config import (
@@ -19,6 +20,7 @@ from config import (
 from logger import log as logger_log
 from utils import load_status, save_status, clear_status, time_str_to_seconds
 from subtitle_parser import parse_subtitles, merge_contiguous_subtitles
+from subtitle_preprocessor import preprocess_text
 from audio_processor import (
     extract_single_audio, merge_single_audio_video, crop_audio,
     adjust_duration_with_rubberband, merge_audio
@@ -45,14 +47,6 @@ class ProgressCallback:
 
 
 # === 字幕文本预处理 ===
-def preprocess_text(text: str) -> str:
-    if not text:
-        return ""
-    text = text.replace("**", "")
-    text = text.strip()
-    return text
-
-
 def post_process_audio_task(index: int, raw_generated_path: str, applied_speed: float, text: str,
                             target_duration_s: float, current_tmp_dir: str):
     output_path_for_merge = os.path.join(current_tmp_dir, f"output_{index}.wav")
@@ -61,13 +55,32 @@ def post_process_audio_task(index: int, raw_generated_path: str, applied_speed: 
         logger_log("POST", f"!! [Task {index}] API生成失败，创建静音占位符。")
         AudioSegment.silent(duration=target_duration_s * 1000).export(output_path_for_merge, format="wav")
         return index
+    # 校验文件大小：0 字节或极小文件视为下载/传输失败
+    try:
+        file_size = os.path.getsize(raw_generated_path)
+    except OSError:
+        file_size = 0
+    if file_size < 100:
+        logger_log("POST", f"!! [Task {index}] 生成音频文件无效 (size={file_size}B)，创建静音占位符。")
+        AudioSegment.silent(duration=target_duration_s * 1000).export(output_path_for_merge, format="wav")
+        try:
+            os.remove(raw_generated_path)
+        except OSError:
+            pass
+        return index
     try:
         actual_raw_duration_s = 0
         try:
             audio = AudioSegment.from_file(raw_generated_path)
             actual_raw_duration_s = (len(audio) / 1000.0) * applied_speed
         except Exception as e:
-            logger_log("POST", f"!! [Task {index}] 无法获取生成音频的时长: {e}")
+            logger_log("POST", f"!! [Task {index}] 无法解码生成音频 (文件可能已损坏)，创建静音占位符: {e}")
+            AudioSegment.silent(duration=target_duration_s * 1000).export(output_path_for_merge, format="wav")
+            try:
+                os.remove(raw_generated_path)
+            except OSError:
+                pass
+            return index
         adjust_duration_with_rubberband(raw_generated_path, output_path_for_merge, target_duration_s)
         try:
             os.remove(raw_generated_path)
@@ -92,7 +105,8 @@ def tts_generation_task(index: int, subtitle: List, main_reference_audio: Union[
         return None, 0, text, 0
 
     target_duration_s = time_str_to_seconds(end_time) - time_str_to_seconds(start_time)
-    predicted_raw_duration_s = duration_predictor.predict_duration(text)
+    with model_lock:
+        predicted_raw_duration_s = duration_predictor.predict_duration(text)
     required_speed = (predicted_raw_duration_s / target_duration_s) if predicted_raw_duration_s > 0.1 else 1.0
     applied_speed = max(MIN_SPEED, min(required_speed, MAX_SPEED))
 
@@ -146,7 +160,8 @@ def _prepare_tts_params(index: int, subtitle: List, main_reference_audio: Union[
             return None
 
     # 4. 计算语速
-    predicted_raw_duration_s = duration_predictor.predict_duration(text)
+    with model_lock:
+        predicted_raw_duration_s = duration_predictor.predict_duration(text)
     required_speed = (predicted_raw_duration_s / target_duration_s) if predicted_raw_duration_s > 0.1 else 1.0
     applied_speed = max(MIN_SPEED, min(required_speed, MAX_SPEED))
 
@@ -177,12 +192,22 @@ def _find_and_merge_video(base_name_no_ext, audio_path, output_folder_zh, srt_pa
 
     found_video_path = _find_video_path(base_name_no_ext, srt_path)
     if found_video_path:
-        log("--- 准备合并音视频 ---")
+        # 合并前先校验视频和音频文件是否真实存在且可读
+        if not os.path.isfile(found_video_path):
+            log(f"!! 警告: 视频文件路径不存在: {found_video_path}，跳过合并。")
+            return
+        if not os.path.isfile(audio_path):
+            log(f"!! 警告: 音频文件路径不存在: {audio_path}，跳过合并。")
+            return
+        log(f"--- 开始合并音视频: {os.path.basename(target_video_output)} ---")
         try:
-            if merge_single_audio_video(found_video_path, audio_path, target_video_output):
-                log(f"视频合并成功: {os.path.basename(target_video_output)}")
+            t0 = time.time()
+            ok, err = merge_single_audio_video(found_video_path, audio_path, target_video_output)
+            elapsed = time.time() - t0
+            if ok:
+                log(f"视频合并成功: {os.path.basename(target_video_output)}  耗时 {elapsed:.1f}s")
             else:
-                log(f"!! 视频合并失败，请检查上方 ffmpeg 错误信息。")
+                log(f"!! 视频合并失败: {err}")
         except Exception as e:
             log(f"!! 合并失败: {e}")
     else:
@@ -270,13 +295,71 @@ def _check_task_skip_or_recover(subtitle_name, output_folder_zh, output_audio_fi
     return "process"
 
 
+def _finalize_audio_video_job(subtitle_name: str,
+                              srt_file: str,
+                              parsed_subtitles: List[List],
+                              current_tmp_dir: str,
+                              output_audio_file: str,
+                              local_status_file: str,
+                              output_folder_zh: str,
+                              srt_path: str,
+                              main_audio_path: str,
+                              audio_extracted_in_this_run: bool,
+                              log: Callable[[str], None]) -> bool:
+    """
+    后台收尾任务：合并字幕片段 WAV、导出整条配音、合成视频、清理临时目录。
+
+    这个函数故意不放进 GPU/CPU dispatcher：它是文件级收尾任务，
+    应该和下一份 SRT 的 TTS 推理并行，而不是阻塞主循环。
+    """
+    task_completed_successfully = False
+    try:
+        if config.ABORT_ALL:
+            log(f"--- [{subtitle_name}] 已中止，跳过后台合并并清理临时文件 ---")
+            return False
+
+        log(f"--- [{subtitle_name}] 字幕片段后台合并中... ---")
+        merged_audio = merge_audio(parsed_subtitles, current_tmp_dir)
+        merged_audio.export(output_audio_file, format="wav")
+        log(f"[{subtitle_name}] 输出音频: {os.path.basename(output_audio_file)}")
+        clear_status(local_status_file)
+        task_completed_successfully = True
+
+        # 后台合并现在会和下一文件 TTS 重叠，训练模型必须和预测/增量训练互斥。
+        with model_lock:
+            duration_predictor.train()
+
+        _find_and_merge_video(subtitle_name, output_audio_file, output_folder_zh, srt_path, log)
+        return True
+    except Exception as e:
+        log(f"!! [{subtitle_name}] 后台合并错误: {e}")
+        return False
+    finally:
+        # 成功或主动中断时清理 tmp；异常时保留 tmp/status，方便下次恢复。
+        if task_completed_successfully or config.ABORT_ALL:
+            if os.path.exists(current_tmp_dir):
+                try:
+                    shutil.rmtree(current_tmp_dir)
+                except Exception as e:
+                    log(f"!! [{subtitle_name}] 清理临时目录失败: {e}")
+
+        # 参考音频是本次从视频提取的，必须等后台合并线程接管完成后再删，避免提前删除。
+        if audio_extracted_in_this_run and os.path.exists(main_audio_path):
+            try:
+                os.remove(main_audio_path)
+            except OSError:
+                pass
+
+
 def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                       max_workers: int = 2,
                       progress_callback=None,
                       server_configs: Dict[str, int] = None,
                       on_server_down=None,
                       on_all_down=None,
-                      max_retries: int = None):
+                      max_retries: int = None,
+                      circuit_breaker_threshold: int = None,
+                      background_merge: bool = False):
     """
     主处理函数。srt_paths 可以是单个字符串（兼容旧调用）或字符串列表。
     """
@@ -355,8 +438,61 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
             max_retries=max_retries if max_retries is not None else config.MAX_RETRIES,
             on_server_down=_on_server_down,
             on_all_down=_on_all_down,
+            circuit_breaker_threshold=circuit_breaker_threshold if circuit_breaker_threshold is not None else getattr(config, 'CIRCUIT_BREAKER_THRESHOLD', 6),
         )
         dispatcher.start()
+
+    # 文件级合并/封装流水线：只开 1 个后台收尾线程，避免多个 ffmpeg/pydub 同时抢磁盘和内存。
+    # 主线程在每个文件 TTS 片段完成后提交后台合并，然后立刻进入下一个文件的 TTS。
+    finalize_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="FINALIZE"
+    )
+    finalize_futures = []
+
+    def _submit_finalize_job(subtitle_name: str,
+                             srt_file: str,
+                             parsed_subtitles: List[List],
+                             current_tmp_dir: str,
+                             output_audio_file: str,
+                             local_status_file: str,
+                             output_folder_zh: str,
+                             srt_path: str,
+                             main_audio_path: str,
+                             audio_extracted_in_this_run: bool):
+        log(f"--- [{subtitle_name}] TTS 片段已完成，后台合并音频/视频；主流程继续下一个文件 ---")
+        future = finalize_executor.submit(
+            _finalize_audio_video_job,
+            subtitle_name,
+            srt_file,
+            parsed_subtitles,
+            current_tmp_dir,
+            output_audio_file,
+            local_status_file,
+            output_folder_zh,
+            srt_path,
+            main_audio_path,
+            audio_extracted_in_this_run,
+            log,
+        )
+        finalize_futures.append((subtitle_name, future))
+
+    def _wait_finalize_jobs() -> bool:
+        if not finalize_futures:
+            return True
+        log(f"--- 等待 {len(finalize_futures)} 个后台合并任务完成 ---")
+        all_ok = True
+        while finalize_futures:
+            subtitle_name, future = finalize_futures.pop(0)
+            try:
+                ok = future.result()
+                if not ok and not config.ABORT_ALL:
+                    all_ok = False
+                    log(f"!! [{subtitle_name}] 后台合并未成功，临时目录已保留，便于下次恢复。")
+            except Exception as e:
+                all_ok = False
+                log(f"!! [{subtitle_name}] 后台合并线程异常: {e}")
+        return all_ok
 
     try:
         for srt_path, srt_file in all_folder_files:
@@ -389,6 +525,13 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                 subtitle_name, output_folder_zh, output_audio_file, srt_path, log
             )
             if skip_result == "skip":
+                # 清理前任遗留的 stale tmp 目录
+                stale_tmp = os.path.join(srt_path, "tmp", hashlib.md5(subtitle_name.encode('utf-8')).hexdigest())
+                if os.path.exists(stale_tmp):
+                    try:
+                        shutil.rmtree(stale_tmp)
+                    except Exception:
+                        pass
                 global_file_idx += 1
                 continue
 
@@ -421,256 +564,294 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
             os.makedirs(current_tmp_dir, exist_ok=True)
             local_status_file = os.path.join(current_tmp_dir, "status.json")
 
+            task_completed_successfully = False
+            finalize_submitted = False
+
             try:
-                with open(os.path.join(srt_path, srt_file), "r", encoding="utf-8") as file:
-                    file_content = file.read()
-            except Exception as e:
-                log(f"读取文件失败: {e}")
-                if audio_extracted_in_this_run and os.path.exists(main_audio_path): os.remove(main_audio_path)
-                global_file_idx += 1
-                continue
+                try:
+                    with open(os.path.join(srt_path, srt_file), "r", encoding="utf-8") as file:
+                        file_content = file.read()
+                except Exception as e:
+                    log(f"读取文件失败: {e}")
+                    global_file_idx += 1
+                    continue
 
-            parsed_subtitles = parse_subtitles(file_content, transformers_line)
-            if not parsed_subtitles:
-                log(f"无有效字幕，跳过。")
-                if audio_extracted_in_this_run and os.path.exists(main_audio_path): os.remove(main_audio_path)
-                global_file_idx += 1
-                continue
+                parsed_subtitles = parse_subtitles(file_content, transformers_line)
+                if not parsed_subtitles:
+                    log(f"无有效字幕，跳过。")
+                    global_file_idx += 1
+                    continue
 
-            # 合并连续字幕，减少 API 调用次数
-            original_count = len(parsed_subtitles)
-            parsed_subtitles = merge_contiguous_subtitles(parsed_subtitles, config.MERGE_MAX_CHARS)
-            merged_count = len(parsed_subtitles)
-            if merged_count < original_count:
-                log(f"  字幕合并: {original_count} 条 → {merged_count} 条")
+                # 合并连续字幕，减少 API 调用次数
+                original_count = len(parsed_subtitles)
+                parsed_subtitles = merge_contiguous_subtitles(parsed_subtitles, config.MERGE_MAX_CHARS)
+                merged_count = len(parsed_subtitles)
+                if merged_count < original_count:
+                    log(f"  字幕合并: {original_count} 条 → {merged_count} 条")
 
-            completed_indices = load_status(local_status_file, srt_file)
-            all_indices = list(range(len(parsed_subtitles)))
+                completed_indices = load_status(local_status_file, srt_file)
+                all_indices = list(range(len(parsed_subtitles)))
 
-            recovered_count = 0
-            for idx in all_indices:
-                if idx not in completed_indices:
-                    potential_wav = os.path.join(current_tmp_dir, f"output_{idx}.wav")
-                    if os.path.exists(potential_wav) and os.path.getsize(potential_wav) > 1000:
-                        completed_indices.add(idx)
-                        recovered_count += 1
-            if recovered_count > 0:
-                log(f"  -> [恢复系统] 扫描到 {recovered_count} 个已存在片段，将跳过。")
-                save_status(local_status_file, srt_file, completed_indices)
-
-            uncompleted_indices = [idx for idx in all_indices if idx not in completed_indices]
-            total_tasks = len(all_indices)
-
-            if progress_callback:
-                progress_callback.set_current_task_range(total_tasks)
-                progress_callback.update_task_progress(len(completed_indices))
-
-            if not uncompleted_indices:
-                log("--- 所有片段均已存在，直接合并 ---")
-            else:
-                if config.ABORT_ALL: break
-
-                # ════════════════════════════════════════
-                # 多服务器动态分发模式
-                # ════════════════════════════════════════
-                if use_multi_server:
-                    log(f"--- [多服务器] 剩余 {len(uncompleted_indices)} 个任务，需求驱动分发 ---")
-
-                    completed_count = len(completed_indices)
-                    file_start_time = time.time()
-                    session_processed_count = 0
-
-                    # ── CPU Worker 注入：rubberband/pydub + 状态保存 ──
-                    def post_process_fn(idx, raw_path, server_url):
-                        if config.ABORT_ALL:
-                            return
-                        params = task_params_map.get(idx)
-                        if params is None:
-                            return
-                        post_process_audio_task(
-                            idx, raw_path,
-                            params["speed"], params["text"],
-                            params["target_duration_s"],
-                            current_tmp_dir
-                        )
-                        with status_lock:
+                recovered_count = 0
+                for idx in all_indices:
+                    if idx not in completed_indices:
+                        potential_wav = os.path.join(current_tmp_dir, f"output_{idx}.wav")
+                        if os.path.exists(potential_wav) and os.path.getsize(potential_wav) > 1000:
                             completed_indices.add(idx)
-                            save_status(local_status_file, srt_file, completed_indices)
+                            recovered_count += 1
+                if recovered_count > 0:
+                    log(f"  -> [恢复系统] 扫描到 {recovered_count} 个已存在片段，将跳过。")
+                    save_status(local_status_file, srt_file, completed_indices)
 
-                    # ── CPU Worker 注入：进度日志 ──
-                    def done_callback(idx, server_url):
-                        nonlocal completed_count, session_processed_count
-                        if config.ABORT_ALL:
-                            return
-                        with status_lock:
-                            completed_count += 1
-                            session_processed_count += 1
-                            elapsed = time.time() - file_start_time
-                            if elapsed > 0 and session_processed_count > 0:
-                                spd = session_processed_count / elapsed
-                                speed_str = f"{spd:.2f} it/s" if spd >= 1 else f"{1 / spd:.2f} s/it"
-                            else:
-                                speed_str = "Calc..."
-                            from urllib.parse import urlparse
-                            _p = urlparse(server_url)
-                            server_tag = f"{_p.hostname}:{_p.port}" if _p.port else _p.hostname
-                            if progress_callback:
-                                progress_callback.update_task_progress(completed_count)
-                            log(f"  -> Task {idx} 完成 ({completed_count}/{total_tasks}) "
-                                f"[{speed_str}] [{server_tag}]")
+                uncompleted_indices = [idx for idx in all_indices if idx not in completed_indices]
+                total_tasks = len(all_indices)
 
-                    # ── 任务迭代器：边裁剪参考音频边喂给调度器 ──
-                    # 记录最后一次成功健康的音频，用于异常/超短音频的容错替代
-                    task_params_map = {}
+                if progress_callback:
+                    progress_callback.set_current_task_range(total_tasks)
+                    progress_callback.update_task_progress(len(completed_indices))
 
-                    def task_iterator():
-                        # 恢复上次中断前最后一个有效的参考音频片段
-                        last_valid_ref_path = _recover_last_ref(
-                            current_tmp_dir, uncompleted_indices, log
-                        )
+                if not uncompleted_indices:
+                    log("--- 所有片段均已存在，直接合并 ---")
+                else:
+                    if config.ABORT_ALL: break
 
-                        # [OOM防护]：仅在此处一次性载入大文件，避免 I/O 阻塞
+                    # ════════════════════════════════════════
+                    # 多服务器动态分发模式
+                    # ════════════════════════════════════════
+                    if use_multi_server:
+                        log(f"--- [多服务器] 剩余 {len(uncompleted_indices)} 个任务，需求驱动分发 ---")
+
+                        completed_count = len(completed_indices)
+                        file_start_time = time.time()
+                        session_processed_count = 0
+
+                        # ── CPU Worker 注入：rubberband/pydub + 状态保存 ──
+                        def post_process_fn(idx, raw_path, server_url):
+                            if config.ABORT_ALL:
+                                return
+                            params = task_params_map.get(idx)
+                            if params is None:
+                                return
+                            post_process_audio_task(
+                                idx, raw_path,
+                                params["speed"], params["text"],
+                                params["target_duration_s"],
+                                current_tmp_dir
+                            )
+                            with status_lock:
+                                completed_indices.add(idx)
+                                save_status(local_status_file, srt_file, completed_indices)
+
+                        # ── CPU Worker 注入：进度日志 ──
+                        def done_callback(idx, server_url):
+                            nonlocal completed_count, session_processed_count
+                            if config.ABORT_ALL:
+                                return
+                            with status_lock:
+                                completed_count += 1
+                                session_processed_count += 1
+                                elapsed = time.time() - file_start_time
+                                if elapsed > 0 and session_processed_count > 0:
+                                    spd = session_processed_count / elapsed
+                                    speed_str = f"{spd:.2f} it/s" if spd >= 1 else f"{1 / spd:.2f} s/it"
+                                else:
+                                    speed_str = "Calc..."
+                                from urllib.parse import urlparse
+                                _p = urlparse(server_url)
+                                server_tag = f"{_p.hostname}:{_p.port}" if _p.port else _p.hostname
+                                if progress_callback:
+                                    progress_callback.update_task_progress(completed_count)
+                                log(f"  -> Task {idx} 完成 ({completed_count}/{total_tasks}) "
+                                    f"[{speed_str}] [{server_tag}]")
+
+                        # ── 任务迭代器：边裁剪参考音频边喂给调度器 ──
+                        # 记录最后一次成功健康的音频，用于异常/超短音频的容错替代
+                        task_params_map = {}
+
+                        def task_iterator():
+                            # 恢复上次中断前最后一个有效的参考音频片段
+                            last_valid_ref_path = _recover_last_ref(
+                                current_tmp_dir, uncompleted_indices, log
+                            )
+
+                            # [OOM防护]：仅在此处一次性载入大文件，避免 I/O 阻塞
+                            try:
+                                log("正在将参考主音频载入内存...")
+                                loaded_main_audio = AudioSegment.from_file(main_audio_path)
+                            except Exception as e:
+                                log(f"内存载入失败，回退至硬盘直读模式: {e}")
+                                loaded_main_audio = main_audio_path
+
+                            try:
+                                for index in uncompleted_indices:
+                                    if config.ABORT_ALL:
+                                        return
+
+                                    params = _prepare_tts_params(
+                                        index, parsed_subtitles[index],
+                                        loaded_main_audio, current_tmp_dir,
+                                        last_valid_ref_path=last_valid_ref_path
+                                    )
+                                    if params is None:
+                                        with status_lock:
+                                            completed_indices.add(index)
+                                        continue
+
+                                    last_valid_ref_path = params["ref_audio_path"]
+                                    task_params_map[index] = params
+
+                                    yield (index, params["ref_audio_path"], params["text"], params["speed"])
+                            finally:
+                                # [OOM防护]：生成器执行完毕（切片任务入队完成）后，强制释放大内存
+                                if 'loaded_main_audio' in locals() and isinstance(loaded_main_audio, AudioSegment):
+                                    del loaded_main_audio
+                                    gc.collect()
+                                    log("已释放内存中的主音频对象。")
+
+                        # run_feeder 在当前线程阻塞运行，内部 put() 受有界队列控制
+                        # Worker 消费一个 → 空出一个位 → 立刻喂入下一个
+                        gen = task_iterator()
                         try:
-                            log("正在将参考主音频载入内存...")
+                            dispatcher.run_feeder(
+                                task_iter=gen,
+                                post_process_fn=post_process_fn,
+                                done_callback=done_callback,
+                                abort_flag_fn=lambda: config.ABORT_ALL,
+                            )
+                        finally:
+                            gen.close()
+
+                    # ════════════════════════════════════════
+                    # 单服务器模式（原有逻辑，完整保留）
+                    # ════════════════════════════════════════
+                    else:
+                        log(f"--- 剩余 {len(uncompleted_indices)} 个任务 (并发数: {max_workers}) ---")
+
+                        pbar = None
+                        if not progress_callback and USE_TQDM_PROGRESS_BAR:
+                            pbar = tqdm(total=len(uncompleted_indices), desc=f"处理 {subtitle_name}")
+
+                        completed_count = len(completed_indices)
+                        file_start_time = time.time()
+                        session_processed_count = 0
+
+                        # [OOM防护]：单机模式一次性载入主音频，避免每个线程重复读取
+                        try:
+                            log("正在将参考主音频载入内存 (单机模式)...")
                             loaded_main_audio = AudioSegment.from_file(main_audio_path)
                         except Exception as e:
                             log(f"内存载入失败，回退至硬盘直读模式: {e}")
                             loaded_main_audio = main_audio_path
 
                         try:
-                            for index in uncompleted_indices:
-                                if config.ABORT_ALL:
-                                    return
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                                futures = set()
+                                for index in uncompleted_indices:
+                                    if config.ABORT_ALL: break
+                                    subtitle = parsed_subtitles[index]
+                                    gen_future = executor.submit(tts_generation_task, index, subtitle,
+                                                                 loaded_main_audio, current_tmp_dir)
 
-                                params = _prepare_tts_params(
-                                    index, parsed_subtitles[index],
-                                    loaded_main_audio, current_tmp_dir,
-                                    last_valid_ref_path=last_valid_ref_path
-                                )
-                                if params is None:
-                                    with status_lock:
-                                        completed_indices.add(index)
-                                    continue
+                                    def process_when_done(fut, idx=index, pbar_instance=pbar):
+                                        nonlocal completed_count, session_processed_count
+                                        if config.ABORT_ALL: return
+                                        try:
+                                            gen_result = fut.result()
+                                            post_result = post_process_audio_task(idx, *gen_result, current_tmp_dir)
+                                            with status_lock:
+                                                completed_indices.add(post_result)
+                                                save_status(local_status_file, srt_file, completed_indices)
+                                                completed_count += 1
+                                                session_processed_count += 1
+                                                elapsed_time = time.time() - file_start_time
+                                                speed_str = ""
+                                                if elapsed_time > 0 and session_processed_count > 0:
+                                                    speed = session_processed_count / elapsed_time
+                                                    speed_str = f"{speed:.2f} it/s" if speed >= 1 else f"{1 / speed:.2f} s/it"
+                                                else:
+                                                    speed_str = "Calc..."
+                                                if progress_callback:
+                                                    progress_callback.update_task_progress(completed_count)
+                                                elif pbar_instance:
+                                                    pbar_instance.update(1)
+                                                log(f"  -> Task {idx} 完成 ({completed_count}/{total_tasks}) [{speed_str}]")
+                                        except Exception as e:
+                                            log(f"!! [Task {idx}] 错误: {e}")
 
-                                last_valid_ref_path = params["ref_audio_path"]
-                                task_params_map[index] = params
-
-                                yield (index, params["ref_audio_path"], params["text"], params["speed"])
+                                    gen_future.add_done_callback(process_when_done)
+                                    futures.add(gen_future)
+                                concurrent.futures.wait(futures)
                         finally:
-                            # [OOM防护]：生成器执行完毕（切片任务入队完成）后，强制释放大内存
+                            # [OOM防护]：单机模式任务队列派发并执行完毕后，强制清理内存
                             if 'loaded_main_audio' in locals() and isinstance(loaded_main_audio, AudioSegment):
                                 del loaded_main_audio
                                 gc.collect()
-                                log("已释放内存中的主音频对象。")
 
-                    # run_feeder 在当前线程阻塞运行，内部 put() 受有界队列控制
-                    # Worker 消费一个 → 空出一个位 → 立刻喂入下一个
-                    gen = task_iterator()
-                    try:
-                        dispatcher.run_feeder(
-                            task_iter=gen,
-                            post_process_fn=post_process_fn,
-                            done_callback=done_callback,
-                            abort_flag_fn=lambda: config.ABORT_ALL,
-                        )
-                    finally:
-                        gen.close()
+                        if pbar: pbar.close()
 
-                # ════════════════════════════════════════
-                # 单服务器模式（原有逻辑，完整保留）
-                # ════════════════════════════════════════
+                if config.ABORT_ALL: break
+
+                # ── 合并：根据设置决定后台异步还是主线程同步 ──
+                if background_merge:
+                    _submit_finalize_job(
+                        subtitle_name=subtitle_name,
+                        srt_file=srt_file,
+                        parsed_subtitles=parsed_subtitles,
+                        current_tmp_dir=current_tmp_dir,
+                        output_audio_file=output_audio_file,
+                        local_status_file=local_status_file,
+                        output_folder_zh=output_folder_zh,
+                        srt_path=srt_path,
+                        main_audio_path=main_audio_path,
+                        audio_extracted_in_this_run=audio_extracted_in_this_run,
+                    )
+                    finalize_submitted = True
                 else:
-                    import concurrent.futures
-                    log(f"--- 剩余 {len(uncompleted_indices)} 个任务 (并发数: {max_workers}) ---")
+                    log(f"--- [{subtitle_name}] 同步合并音频/视频... ---")
+                    ok = _finalize_audio_video_job(
+                        subtitle_name=subtitle_name,
+                        srt_file=srt_file,
+                        parsed_subtitles=parsed_subtitles,
+                        current_tmp_dir=current_tmp_dir,
+                        output_audio_file=output_audio_file,
+                        local_status_file=local_status_file,
+                        output_folder_zh=output_folder_zh,
+                        srt_path=srt_path,
+                        main_audio_path=main_audio_path,
+                        audio_extracted_in_this_run=audio_extracted_in_this_run,
+                        log=log,
+                    )
+                    if not ok:
+                        log(f"!! [{subtitle_name}] 同步合并失败")
 
-                    pbar = None
-                    if not progress_callback and USE_TQDM_PROGRESS_BAR:
-                        pbar = tqdm(total=len(uncompleted_indices), desc=f"处理 {subtitle_name}")
+                global_file_idx += 1
 
-                    completed_count = len(completed_indices)
-                    file_start_time = time.time()
-                    session_processed_count = 0
-
-                    # [OOM防护]：单机模式一次性载入主音频，避免每个线程重复读取
-                    try:
-                        log("正在将参考主音频载入内存 (单机模式)...")
-                        loaded_main_audio = AudioSegment.from_file(main_audio_path)
-                    except Exception as e:
-                        log(f"内存载入失败，回退至硬盘直读模式: {e}")
-                        loaded_main_audio = main_audio_path
-
-                    try:
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                            futures = set()
-                            for index in uncompleted_indices:
-                                if config.ABORT_ALL: break
-                                subtitle = parsed_subtitles[index]
-                                gen_future = executor.submit(tts_generation_task, index, subtitle,
-                                                             loaded_main_audio, current_tmp_dir)
-
-                                def process_when_done(fut, idx=index, pbar_instance=pbar):
-                                    nonlocal completed_count, session_processed_count
-                                    if config.ABORT_ALL: return
-                                    try:
-                                        gen_result = fut.result()
-                                        post_result = post_process_audio_task(idx, *gen_result, current_tmp_dir)
-                                        with status_lock:
-                                            completed_indices.add(post_result)
-                                            save_status(local_status_file, srt_file, completed_indices)
-                                            completed_count += 1
-                                            session_processed_count += 1
-                                            elapsed_time = time.time() - file_start_time
-                                            speed_str = ""
-                                            if elapsed_time > 0 and session_processed_count > 0:
-                                                speed = session_processed_count / elapsed_time
-                                                speed_str = f"{speed:.2f} it/s" if speed >= 1 else f"{1 / speed:.2f} s/it"
-                                            else:
-                                                speed_str = "Calc..."
-                                            if progress_callback:
-                                                progress_callback.update_task_progress(completed_count)
-                                            elif pbar_instance:
-                                                pbar_instance.update(1)
-                                            log(f"  -> Task {idx} 完成 ({completed_count}/{total_tasks}) [{speed_str}]")
-                                    except Exception as e:
-                                        log(f"!! [Task {idx}] 错误: {e}")
-
-                                gen_future.add_done_callback(process_when_done)
-                                futures.add(gen_future)
-                            concurrent.futures.wait(futures)
-                    finally:
-                        # [OOM防护]：单机模式任务队列派发并执行完毕后，强制清理内存
-                        if 'loaded_main_audio' in locals() and isinstance(loaded_main_audio, AudioSegment):
-                            del loaded_main_audio
-                            gc.collect()
-
-                    if pbar: pbar.close()
-
-            if config.ABORT_ALL: break
-
-            log("--- 字幕片段合并中... ---")
-            try:
-                merged_audio = merge_audio(parsed_subtitles, current_tmp_dir)
-                merged_audio.export(output_audio_file, format="wav")
-                log(f"输出音频: {os.path.basename(output_audio_file)}")
-                clear_status(local_status_file)
-                if os.path.exists(current_tmp_dir):
-                    shutil.rmtree(current_tmp_dir)
-                duration_predictor.train()
-                _find_and_merge_video(subtitle_name, output_audio_file, output_folder_zh, srt_path, log)
-            except Exception as e:
-                log(f"!! 合并错误: {e}")
             finally:
-                if os.path.exists(main_audio_path):
-                    try:
-                        os.remove(main_audio_path)
-                    except OSError:
-                        pass
+                # 已提交后台合并的文件，由后台收尾线程负责清理 tmp 和本次提取的参考音频。
+                # 未提交后台合并的文件，仍按原逻辑在这里清理，避免异常路径泄漏资源。
+                if not finalize_submitted:
+                    if task_completed_successfully or config.ABORT_ALL:
+                        if os.path.exists(current_tmp_dir):
+                            try:
+                                shutil.rmtree(current_tmp_dir)
+                            except Exception as e:
+                                log(f"!! 清理临时目录失败: {e}")
+                    if audio_extracted_in_this_run and os.path.exists(main_audio_path):
+                        try:
+                            os.remove(main_audio_path)
+                        except OSError:
+                            pass
 
-            global_file_idx += 1
+        finalize_all_ok = _wait_finalize_jobs()
 
         if progress_callback:
             progress_callback.update_file_progress(total_files)
-        msg = "\n=== 任务已强制停止 ===" if config.ABORT_ALL else "\n=== 所有任务处理完毕 ==="
+        if config.ABORT_ALL:
+            msg = "\n=== 任务已强制停止 ==="
+        elif finalize_all_ok:
+            msg = "\n=== 所有任务处理完毕 ==="
+        else:
+            msg = "\n=== TTS 已完成，但部分后台合并失败 ==="
         log(msg)
 
         for _srt_path in srt_paths:
@@ -681,10 +862,22 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                 except Exception:
                     pass
 
+        return (not config.ABORT_ALL) and finalize_all_ok
+
+    except Exception as e:
+        log(f"!!! 主处理流程发生严重崩溃: {e}")
+        import traceback
+        log(traceback.format_exc())
+
     finally:
         # ── 全局关闭调度器 ──
         if dispatcher:
             dispatcher.stop()
+        try:
+            _wait_finalize_jobs()
+        except Exception:
+            pass
+        finalize_executor.shutdown(wait=True)
 
 
 if __name__ == '__main__':
