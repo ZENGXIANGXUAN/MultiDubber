@@ -257,6 +257,35 @@ def _extract_audio_path(result) -> Optional[str]:
     return None
 
 
+def _validate_returned_audio(path: Optional[str]) -> Tuple[bool, str]:
+    """
+    检查云端返回的音频文件是否有效可用：
+    1. 路径非空且在本地文件系统实际存在
+    2. 文件大小 >= 100 字节（排除空文件或返回的纯文本错误信息）
+    3. 音频头格式合法且至少包含 1 个有效音频帧（排除损坏文件）
+    """
+    if not path:
+        return False, "云端返回为空或未包含有效音频路径"
+    if not os.path.exists(path):
+        return False, f"云端返回的本地文件不存在: {path}"
+    try:
+        size = os.path.getsize(path)
+        if size < 100:
+            return False, f"云端返回文件过小 (size={size}B)，判定为传输或生成不完整"
+        with open(path, "rb") as f:
+            header = f.read(12)
+        if header.startswith(b"RIFF"):
+            import wave
+            with wave.open(path, "rb") as w:
+                if w.getnframes() <= 0:
+                    return False, "WAV 文件中无有效音频帧 (frames=0)"
+        elif not (header.startswith(b"ID3") or header.startswith(b"\xff\xfb") or header.startswith(b"OggS") or header.startswith(b"fLaC")):
+            return False, f"云端返回文件非音频格式 (header={header[:8]!r})"
+    except Exception as e:
+        return False, f"解析返回音频失败 (文件可能已损坏): {e}"
+    return True, ""
+
+
 # ──────────────────────────────────────────────
 # GPU 调用（根据节点绑定的静态协议直接调用，无动态判断）
 # ──────────────────────────────────────────────
@@ -269,8 +298,8 @@ def _call_api_on_server(url: str, ref_audio_path: str,
     返回 (raw_audio_path, fail_kind)
 
     fail_kind:
-      - _FAIL_NONE    成功
-      - _FAIL_API     配音/API 本身失败，计入任务失败重试次数
+      - _FAIL_NONE    成功（且返回音频文件已验证可用）
+      - _FAIL_API     配音/API 本身失败或返回音频不可用，计入任务失败重试次数
       - _FAIL_NETWORK 网络/连接问题，不计入任务失败重试次数
     """
     if not os.path.exists(ref_audio_path):
@@ -323,10 +352,11 @@ def _call_api_on_server(url: str, ref_audio_path: str,
             _log("API_DONE", f"{label} ({proto_name}) | 耗时 {elapsed:.2f}s")
 
         path = _extract_audio_path(result)
-        if path:
+        is_valid, err_msg = _validate_returned_audio(path)
+        if is_valid:
             return path, _FAIL_NONE
 
-        _log("API_ERR", f"{label} ({proto_name}) | API 返回为空或格式异常，计入配音失败。")
+        _log("API_ERR", f"{label} ({proto_name}) | 云端返回音频无效 ({err_msg})，计入配音重试。")
         return None, _FAIL_API
 
     except Exception as e:
