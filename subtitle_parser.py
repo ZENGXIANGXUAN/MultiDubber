@@ -1,5 +1,6 @@
 from config import TIME_LINE, TRANSFORMERS_LINE, ENGLISH_LINE
 from logger import log as _log
+from subtitle_preprocessor import should_skip_short_segment
 
 
 def parse_subtitles(file_content: str, transformers_line: int = TRANSFORMERS_LINE) -> list[list[str]]:
@@ -8,6 +9,7 @@ def parse_subtitles(file_content: str, transformers_line: int = TRANSFORMERS_LIN
     for idx, segment in enumerate(subtitles):
         lines = segment.strip().splitlines()
         if len(lines) < TIME_LINE + 1: continue
+        if should_skip_short_segment(lines): continue
         time_line = lines[TIME_LINE].strip()
         if " --> " not in time_line: continue
         try:

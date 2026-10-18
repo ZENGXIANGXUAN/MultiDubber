@@ -5,6 +5,19 @@ import sys
 from typing import Optional, List, Union
 import numpy as np
 
+
+def _safe_print(message: str) -> None:
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return
+    try:
+        if getattr(stream, "closed", False):
+            return
+        stream.write(str(message) + "\n")
+        stream.flush()
+    except Exception:
+        pass
+
 # ==============================================================================
 # 【核弹级防弹窗补丁】 START
 # 这段代码必须放在 import pydub 或 import pyrubberband 之前执行
@@ -39,6 +52,7 @@ if os.name == 'nt':  # 仅限 Windows
 
 # 必须在补丁应用之后再导入这些库
 from pydub import AudioSegment
+from pydub import AudioSegment
 import soundfile as sf
 import pyrubberband as rb
 
@@ -49,47 +63,147 @@ if os.path.exists(RUBBERBAND_DIR):
     os.environ["PATH"] += os.pathsep + RUBBERBAND_DIR
     exe_path = os.path.join(RUBBERBAND_DIR, "rubberband.exe")
     if not os.path.exists(exe_path):
-        print(f"Warning: rubberband directory found but rubberband.exe is missing at {exe_path}")
+        _safe_print(f"Warning: rubberband directory found but rubberband.exe is missing at {exe_path}")
 else:
-    print(f"Warning: Local rubberband directory not found at {RUBBERBAND_DIR}")
+    _safe_print(f"Warning: Local rubberband directory not found at {RUBBERBAND_DIR}")
 
 from config import USE_TQDM_PROGRESS_BAR, MIN_RUBBERBAND_RATE
+from logger import log as logger_log
 from utils import check_ffmpeg, time_str_to_seconds
+
+
+def _target_samples(duration_s: float, sample_rate: int) -> int:
+    return max(1, int(round(max(0.0, duration_s) * sample_rate)))
+
+
+def _fit_array_to_samples(y: np.ndarray, target_samples: int) -> np.ndarray:
+    current_samples = len(y)
+    if current_samples == target_samples:
+        return y
+    if current_samples > target_samples:
+        return y[:target_samples]
+
+    pad_samples = target_samples - current_samples
+    shape = (pad_samples, y.shape[1]) if y.ndim > 1 else (pad_samples,)
+    return np.concatenate((y, np.zeros(shape, dtype=y.dtype)))
+
+
+def _time_str_to_ms(time_str: str) -> int:
+    return int(round(time_str_to_seconds(time_str) * 1000))
+
+
+def _subtitle_ms_bounds(subtitle: List) -> tuple[int, int]:
+    start_ms = _time_str_to_ms(subtitle[0])
+    end_ms = max(start_ms, _time_str_to_ms(subtitle[1]))
+    return start_ms, end_ms
+
+
+def _fit_audio_segment(audio_segment: AudioSegment, target_duration_ms: int) -> AudioSegment:
+    target_duration_ms = max(0, int(round(target_duration_ms)))
+    current_duration_ms = len(audio_segment)
+    if current_duration_ms == target_duration_ms:
+        return audio_segment
+    if current_duration_ms > target_duration_ms:
+        return audio_segment[:target_duration_ms]
+    return audio_segment + AudioSegment.silent(duration=target_duration_ms - current_duration_ms)
+
+
+def inspect_audio_segments(parsed_subtitles: List[List], current_tmp_dir: str,
+                           duration_tolerance_ms: int = 80) -> List[dict]:
+    issues = []
+    for i, subtitle in enumerate(parsed_subtitles):
+        start_ms, end_ms = _subtitle_ms_bounds(subtitle)
+        target_duration_ms = end_ms - start_ms
+        segment_file = os.path.join(current_tmp_dir, f"output_{i}.wav")
+        issue_base = {
+            "index": i,
+            "path": segment_file,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "target_ms": target_duration_ms,
+        }
+
+        if not os.path.exists(segment_file):
+            issues.append({**issue_base, "type": "missing"})
+            continue
+
+        try:
+            size_bytes = os.path.getsize(segment_file)
+        except OSError as e:
+            issues.append({**issue_base, "type": "stat_error", "error": str(e)})
+            continue
+
+        issue_base = {**issue_base, "size_bytes": size_bytes}
+        if size_bytes < 1000:
+            issues.append({**issue_base, "type": "too_small"})
+            continue
+
+        try:
+            audio_segment = AudioSegment.from_file(segment_file)
+        except Exception as e:
+            issues.append({**issue_base, "type": "unreadable", "error": str(e)})
+            continue
+
+        actual_ms = len(audio_segment)
+        if actual_ms <= 0 and target_duration_ms > 0:
+            issues.append({
+                **issue_base,
+                "type": "empty_audio",
+                "actual_ms": actual_ms,
+                "delta_ms": -target_duration_ms,
+            })
+            continue
+
+        delta_ms = actual_ms - target_duration_ms
+        if abs(delta_ms) > duration_tolerance_ms:
+            issues.append({
+                **issue_base,
+                "type": "duration_mismatch",
+                "actual_ms": actual_ms,
+                "delta_ms": delta_ms,
+            })
+
+    return issues
 
 
 def merge_single_audio_video(video_file, audio_file, output_file):
     """
     将单个音频文件和视频文件合并成一个MP4视频文件。
+    返回 (True, None) 成功，(False, error_msg) 失败。
     """
     if not os.path.exists(video_file):
-        print(f"错误：视频文件 '{video_file}' 不存在。")
-        return False
+        return False, f"视频文件不存在: {video_file}"
     if not os.path.exists(audio_file):
-        print(f"错误：音频文件 '{audio_file}' 不存在。")
-        return False
+        return False, f"音频文件不存在: {audio_file}"
     if not check_ffmpeg():
-        return False
+        return False, "ffmpeg 未安装或不可用"
     output_dir = os.path.dirname(output_file)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
     cmd = [
-        "ffmpeg", "-i", video_file, "-i", audio_file, "-c:v", "copy", "-c:a", "aac",
-        "-map", "0:v:0", "-map", "1:a:0", "-shortest", "-y", output_file
+        "ffmpeg",
+        "-fflags", "+genpts",
+        "-i", video_file,
+        "-i", audio_file,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-ar", "44100",
+        "-ac", "2",
+        "-shortest",
+        "-avoid_negative_ts", "make_zero",
+        "-movflags", "+faststart",
+        "-y", output_file
     ]
     try:
-        # 由于上面已经应用了全局补丁，这里其实不需要手动加 flags 了，
-        # 但为了双重保险，保留也可以。全局补丁会覆盖它。
         process = subprocess.run(cmd, capture_output=True, check=True, text=True, encoding='utf-8')
-        print(f"  成功合并到 '{output_file}'。")
-        return True
+        return True, None
     except subprocess.CalledProcessError as e:
-        print(f"  错误：合并失败。")
-        print(f"  ffmpeg 命令: {' '.join(cmd)}")
-        print(f"  ffmpeg 标准错误:\n    {e.stderr.strip()}")
-        return False
+        stderr = e.stderr.strip() if e.stderr else "(无 stderr 输出)"
+        return False, f"ffmpeg 合并失败 (exit {e.returncode})\n  命令: {' '.join(cmd)}\n  stderr: {stderr}"
     except Exception as e:
-        print(f"  处理时发生意外错误: {e}")
-        return False
+        return False, f"合并时发生意外错误: {e}"
 
 
 def extract_single_audio(video_path, audio_output_path):
@@ -113,13 +227,13 @@ def extract_single_audio(video_path, audio_output_path):
 
         if result.returncode == 0:
             if not USE_TQDM_PROGRESS_BAR:
-                print(f"[提取成功] 临时参考音频: {os.path.basename(audio_output_path)}")
+                _safe_print(f"[提取成功] 临时参考音频: {os.path.basename(audio_output_path)}")
             return True
         else:
-            print(f"[提取失败] 无法从 '{os.path.basename(video_path)}' 提取音频: {result.stderr}")
+            _safe_print(f"[提取失败] 无法从 '{os.path.basename(video_path)}' 提取音频: {result.stderr}")
             return False
     except Exception as e:
-        print(f"[提取错误] {e}")
+        _safe_print(f"[提取错误] {e}")
         return False
 
 
@@ -136,25 +250,29 @@ def crop_audio(start_time_str: str, end_time_str: str, input_file_or_audio: Unio
 
         return audio[max(0, start_ms):end_ms]
     except Exception as e:
-        print(f"!! 裁剪或读取音频时发生错误: {e}")
+        _safe_print(f"!! 裁剪或读取音频时发生错误: {e}")
         return None
 
 
 def adjust_duration_with_rubberband(input_path: str, output_path: str, target_duration_s: float):
     try:
         y, sr = sf.read(input_path)
+        target_samples = _target_samples(target_duration_s, sr)
+        target_duration_s = target_samples / sr
         current_duration_s = len(y) / sr
         if current_duration_s < 0.01:
-            shape = (int(target_duration_s * sr), y.shape[1]) if y.ndim > 1 else (int(target_duration_s * sr),)
+            shape = (target_samples, y.shape[1]) if y.ndim > 1 else (target_samples,)
             sf.write(output_path, np.zeros(shape, dtype=y.dtype), sr)
             return
         rate = current_duration_s / target_duration_s
-        if abs(rate - 1.0) < 0.001: shutil.copy(input_path, output_path); return
+        if abs(rate - 1.0) < 0.001:
+            sf.write(output_path, _fit_array_to_samples(y, target_samples), sr)
+            return
         if not USE_TQDM_PROGRESS_BAR:
-            print(f"    -> 需调节时长：从 {current_duration_s:.2f}s 到 {target_duration_s:.2f}s (原始速率: {rate:.2f}x)")
+            _safe_print(f"    -> 需调节时长：从 {current_duration_s:.2f}s 到 {target_duration_s:.2f}s (原始速率: {rate:.2f}x)")
         if rate < MIN_RUBBERBAND_RATE:
             if not USE_TQDM_PROGRESS_BAR:
-                print(
+                _safe_print(
                     f"    -> 警告: 速率 {rate:.2f}x 低于下限 {MIN_RUBBERBAND_RATE}x。将以 {MIN_RUBBERBAND_RATE}x 速度拉伸并补充静音。")
 
             # rb.time_stretch 在后台调用 rubberband.exe
@@ -168,36 +286,34 @@ def adjust_duration_with_rubberband(input_path: str, output_path: str, target_du
                 silence_samples = int(silence_to_add_s * sr)
                 shape = (silence_samples, y.shape[1]) if y.ndim > 1 else (silence_samples,)
                 final_y = np.concatenate((stretched_y, np.zeros(shape, dtype=y.dtype)))
-            sf.write(output_path, final_y, sr)
+            sf.write(output_path, _fit_array_to_samples(final_y, target_samples), sr)
         else:
             stretched_y = rb.time_stretch(y, sr, rate)
-            sf.write(output_path, stretched_y, sr)
+            sf.write(output_path, _fit_array_to_samples(stretched_y, target_samples), sr)
     except Exception as e:
-        print(f"!! 时长调节时发生严重错误: {e}")
+        _safe_print(f"!! 时长调节时发生严重错误: {e}")
         shutil.copy(input_path, output_path)
 
 
 def merge_audio(parsed_subtitles: List[List], current_tmp_dir: str) -> AudioSegment:
     merged_audio = AudioSegment.empty()
     if not parsed_subtitles: return merged_audio
-    print("\n--- 开始合并音频片段 ---")
-    first_start_sec = time_str_to_seconds(parsed_subtitles[0][0])
-    if first_start_sec > 0:
-        merged_audio += AudioSegment.silent(duration=first_start_sec * 1000)
+    total = len(parsed_subtitles)
+    logger_log("MERGE", f"开始合并音频片段 ({total} 段)")
     for i, subtitle in enumerate(parsed_subtitles):
-        start_time_str, end_time_str, _, _ = subtitle
-        target_duration_ms = (time_str_to_seconds(end_time_str) - time_str_to_seconds(start_time_str)) * 1000
+        start_ms, end_ms = _subtitle_ms_bounds(subtitle)
+        target_duration_ms = end_ms - start_ms
+        if len(merged_audio) < start_ms:
+            merged_audio += AudioSegment.silent(duration=start_ms - len(merged_audio))
         segment_file = os.path.join(current_tmp_dir, f"output_{i}.wav")
         try:
             audio_segment = AudioSegment.from_file(segment_file)
-            merged_audio += audio_segment
+            merged_audio += _fit_audio_segment(audio_segment, target_duration_ms)
         except Exception as e:
-            print(f"!! 警告: 无法读取文件 {segment_file} ({e})。将使用 {target_duration_ms / 1000:.2f}s 的静音代替。")
+            logger_log("MERGE", f"!! 无法读取 {segment_file} ({e})，用静音代替。")
             merged_audio += AudioSegment.silent(duration=target_duration_ms)
-        if i < len(parsed_subtitles) - 1:
-            current_end_sec = time_str_to_seconds(end_time_str)
-            next_start_sec = time_str_to_seconds(parsed_subtitles[i + 1][0])
-            gap_sec = next_start_sec - current_end_sec
-            if gap_sec > 0.001:
-                merged_audio += AudioSegment.silent(duration=gap_sec * 1000)
+        # 每 5 段或最后一段汇报进度
+        if (i + 1) % 5 == 0 or i + 1 == total:
+            logger_log("MERGE", f"合并进度: {i + 1}/{total} ({(i + 1) * 100 // total}%)")
+    logger_log("MERGE", f"合并完成，总时长 {len(merged_audio) / 1000:.1f}s")
     return merged_audio

@@ -64,7 +64,7 @@ DEFAULT_SETTINGS = {
     "line_index": 2,
     "max_retries": 5,
     "circuit_breaker_threshold": 6,
-    "webhook_url": "https://sctapi.ftqq.com/SCT124090TODYAymp8nuHDeqleLu8oRDAS.send",
+    "webhook_url": "",
     "servers": [],
     "api_public_key": "",
     "api_private_key": "",

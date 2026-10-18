@@ -1,82 +1,62 @@
-# MultiTTS - 多功能文本转语音工具
+# MultiTTS
 
-MultiTTS 是一个基于多种 TTS 引擎的文本转语音工具，支持批量处理、音频处理等功能。
+MultiTTS 是一个面向字幕批量配音的桌面工具，当前固定使用 **IndexTTS 1.5** 的 Gradio `/gen_single` 接口。
 
-## 特性
+## 功能
 
-- 支持多种 TTS 引擎
-- 批量文本转语音
-- 音频格式转换和处理
-- 图形用户界面
-- 字幕文件处理
+- 解析和预处理字幕文件
+- 单服务器或多服务器并发生成语音
+- 自动裁剪参考音频并匹配字幕时长
+- 合并音频片段并输出最终音轨
+- 本地缓存、失败重试和服务器熔断
+- PyQt 图形界面
 
-## 重要说明
+## 运行要求
 
-本项目目前仅支持 IndexTTS 1.5 接口。如需使用其他接口，请按照以下步骤进行修改：
-
-### 修改接口方法
-
-1. 找到 `api_client.py` 文件
-2. 定位到 TTS 请求的相关函数
-3. 修改 API 端点 URL 和请求参数以适配新的接口
-4. 根据新接口的文档调整认证方式和数据格式
-
-例如，如果要切换到另一个 TTS 服务：
-```python
-# 修改前（IndexTTS 1.5）
-def call_tts_api(text, voice_params):
-    url = "https://index-tts-api.example.com/v1.5/synthesize"
-    # ... 其他代码
-
-# 修改后（新接口示例）
-def call_tts_api(text, voice_params):
-    url = "https://new-tts-api.example.com/v2/synthesize"
-    # ... 根据新接口调整的代码
-```
+- Python 3.12 或更高版本
+- 可访问的 IndexTTS 1.5 Gradio 服务
+- FFmpeg
+- Rubber Band（项目可使用 `rubberband/` 下的本地程序）
 
 ## 安装
 
-1. 克隆仓库：
-   ```bash
-   git clone https://github.com/ZENGXIANGXUAN/MultiDubber.git
-   cd MultiDubber
-   ```
+推荐使用项目锁定的依赖：
 
-2. 安装依赖：
-   ```bash
-   pip install -r requirements.txt
-   ```
+```powershell
+uv sync
+```
+
+也可以使用传统方式：
+
+```powershell
+pip install -r requirements.txt
+```
 
 ## 使用
 
-运行主程序：
-```bash
-python main.py
+Windows 下可以直接运行：
+
+```powershell
+.\runTTS.bat
 ```
 
-或者使用批处理文件：
-```bash
-runTTS.bat
+或启动图形界面：
+
+```powershell
+.venv\Scripts\python.exe .\gui.pyw
 ```
 
-## 文件说明
+在设置中填写 IndexTTS 1.5 服务地址。多服务器地址按界面提示配置，所有节点都必须使用相同的 1.5 接口。
 
-- `main.py` - 主程序入口
-- `api_client.py` - API 客户端，用于与 TTS 服务通信
-- `gui.pyw` - 图形用户界面
-- `model.py` - 模型相关功能
-- `audio_processor.py` - 音频处理功能
-- `subtitle_parser.py` - 字幕解析功能
-- `utils.py` - 工具函数
-- `config.py` - 配置文件
-- `dispatcher.py` - 任务调度器
-- `requirements.txt` - 项目依赖
+## 主要文件
 
-## 注意事项
+- `gui.pyw`：图形界面
+- `main.py`：配音处理流程
+- `api_client.py`：单服务器连接管理
+- `dispatcher.py`：多服务器任务调度
+- `indextts_15.py`：IndexTTS 1.5 请求参数的唯一实现
+- `audio_processor.py`：音频裁剪、时长调整与合并
+- `subtitle_parser.py`：字幕解析
+- `config.py`：运行配置
 
-- 请确保在使用时遵守相应 TTS 服务的使用条款
-- 音频处理功能依赖于外部库，如 `pyrubberband` 等
-
-## 项目来源
-
-本项目基于 [MultiDubber](https://github.com/ZENGXIANGXUAN/MultiDubber.git) 进行开发。
+项目基于 [MultiDubber](https://github.com/ZENGXIANGXUAN/MultiDubber.git) 继续开发。

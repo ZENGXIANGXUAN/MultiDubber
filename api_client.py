@@ -1,129 +1,169 @@
 import os
 import threading
-from typing import Optional
-from gradio_client import Client
+from typing import Optional, Tuple
 
-# ✨ 确保单机模式与集群模式共享相同的 Gradio 5.x/4.x 文件包装适配器
+from gradio_client import Client
+import httpx
+
 try:
     from gradio_client import handle_file as file
 except ImportError:
     from gradio_client import file
+
 import warnings
+
 import config
+import indextts_15
+import voxcpm2
 from logger import log as _log
 
-# Suppress specific warnings
-warnings.filterwarnings("ignore", category=UserWarning, module='gradio_client.utils')
 
-# Thread-local storage for per-thread Client instances
+warnings.filterwarnings("ignore", category=UserWarning, module="gradio_client.utils")
+
+# Gradio Client 不是线程安全的，每个工作线程复用自己的连接。
 _thread_local = threading.local()
 
+PROTOCOL_LABELS = {
+    config.PROTOCOL_INDEXTTS15: "IndexTTS 1.5",
+    config.PROTOCOL_VOXCPM2: "VoxCPM 2.0",
+}
 
-def test_connection(url: str) -> bool:
+
+def detect_protocol_from_client(client: Client) -> str:
+    """从已连接的 Gradio Client 实例中识别服务协议。"""
+    # 1. 优先检查 client.endpoints 实例列表
+    try:
+        endpoints = getattr(client, "endpoints", [])
+        api_names = [getattr(ep, "api_name", None) for ep in endpoints]
+        if "/gen_single" in api_names:
+            return config.PROTOCOL_INDEXTTS15
+        if "/generate" in api_names:
+            return config.PROTOCOL_VOXCPM2
+    except Exception:
+        pass
+
+    # 2. 检查 view_api 字典
+    try:
+        api_info = client.view_api(print_info=False, return_format="dict")
+        named = api_info.get("named_endpoints", {}) if isinstance(api_info, dict) else {}
+        if "/gen_single" in named:
+            return config.PROTOCOL_INDEXTTS15
+        if "/generate" in named:
+            return config.PROTOCOL_VOXCPM2
+    except Exception:
+        pass
+
+    # 3. 检查 config 字典
+    try:
+        deps = client.config.get("dependencies", [])
+        api_names = [d.get("api_name") for d in deps if isinstance(d, dict)]
+        if "/gen_single" in api_names or "gen_single" in api_names:
+            return config.PROTOCOL_INDEXTTS15
+        if "/generate" in api_names or "generate" in api_names:
+            return config.PROTOCOL_VOXCPM2
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+def test_connection(url: str) -> Tuple[bool, str, str]:
+    """验证服务是否可连接并自动探测协议类型。
+
+    在添加服务器时一次性确定协议，返回 (success, protocol, message)。
+    测试 Client 用完立即关闭，不参与正式推理。
+    """
+    client = None
     try:
         _log("CONNECT", f"正在测试连接: {url} ...")
-        cli = Client(url)
-        # 探测 API 版本：检查 v2.0 专属特征端点
-        try:
-            api_info = cli.view_api(return_format="dict", print_info=False)
-            named_endpoints = api_info.get("named_endpoints", {})
-            if "/on_method_change" in named_endpoints or "/on_add_glossary_term" in named_endpoints:
-                version = "2.0"
-            else:
-                version = "1.5"
-        except Exception:
-            version = "未知"
-        _log("CONNECT", f"连接成功！接口协议: v{version}")
-        return True
-    except Exception as e:
-        _log("CONNECT", f"连接失败: {e}")
-        return False
+        client = Client(
+            url,
+            verbose=False,
+            httpx_kwargs={"timeout": httpx.Timeout(12.0, connect=8.0)},
+        )
+        proto = detect_protocol_from_client(client)
+        proto_name = PROTOCOL_LABELS.get(proto, proto)
+        _log("CONNECT", f"连接成功！接口协议: {proto_name}")
+        return True, proto, f"连接成功 ({proto_name})"
+    except Exception as exc:
+        _log("CONNECT", f"连接失败: {exc}")
+        return False, "unknown", str(exc)
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 class TTSClient:
     @classmethod
-    def get_client(cls):
-        # Each thread gets its own Client instance
-        if not hasattr(_thread_local, "client") or getattr(_thread_local, "connected_url", None) != config.GRADIO_URL:
+    def get_client(cls) -> Client:
+        connected_url = getattr(_thread_local, "connected_url", None)
+        if not hasattr(_thread_local, "client") or connected_url != config.GRADIO_URL:
+            thread_name = threading.current_thread().name
             try:
-                thread_name = threading.current_thread().name
                 _log("CONNECT", f"[{thread_name}] 正在连接到 Gradio 服务 ({config.GRADIO_URL})...")
-                _thread_local.client = Client(config.GRADIO_URL)
+                # 初始化阶段限制握手/元数据读取时间，防止永久卡住；
+                # 初始化完成后改为“仅限制 connect”，避免长时间 TTS 推理被 read timeout 误杀。
+                _thread_local.client = Client(
+                    config.GRADIO_URL,
+                    verbose=False,
+                    httpx_kwargs={"timeout": httpx.Timeout(15.0, connect=8.0)},
+                )
+                _thread_local.client.httpx_kwargs["timeout"] = httpx.Timeout(None, connect=10.0)
                 _thread_local.connected_url = config.GRADIO_URL
-                # 探测 API 版本：检查 v2.0 专属特征端点
-                try:
-                    api_info = _thread_local.client.view_api(return_format="dict", print_info=False)
-                    named_endpoints = api_info.get("named_endpoints", {})
-                    if "/on_method_change" in named_endpoints or "/on_add_glossary_term" in named_endpoints:
-                        _thread_local.api_version = "2.0"
-                    else:
-                        _thread_local.api_version = "1.5"
-                except Exception:
-                    _thread_local.api_version = "1.5"
-                _log("CONNECT", f"[{thread_name}] 连接成功！接口协议: v{_thread_local.api_version}")
-            except Exception as e:
-                _log("CONNECT", f"[{thread_name}] 无法连接到 Gradio 服务。错误: {e}")
-                raise e
+                proto = detect_protocol_from_client(_thread_local.client)
+                proto_name = PROTOCOL_LABELS.get(proto, proto)
+                _log("CONNECT", f"[{thread_name}] 连接成功！接口协议: {proto_name}")
+            except Exception as exc:
+                _log("CONNECT", f"[{thread_name}] 无法连接到 Gradio 服务。错误: {exc}")
+                raise
         return _thread_local.client
 
-    @classmethod
-    def get_api_version(cls) -> str:
-        """返回当前线程缓存的 API 版本，未连接时默认 '1.5'"""
-        return getattr(_thread_local, "api_version", "1.5")
+
+def _extract_audio_path(result) -> Optional[str]:
+    """提取音频 filepath（兼容 IndexTTS 与 VoxCPM 返回格式）。"""
+    if result is None:
+        return None
+    if isinstance(result, (tuple, list)):
+        return _extract_audio_path(result[0]) if result else None
+    if isinstance(result, dict):
+        return result.get("value") or result.get("path") or result.get("url") or result.get("name")
+    if isinstance(result, str):
+        return result
+    return None
 
 
-def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float) -> Optional[str]:
+def generate_audio_api(ref_audio_path: str, gen_text: str, speed: float,
+                       protocol: str = None) -> Optional[str]:
+    """单机模式调用 TTS 接口。"""
     if not os.path.exists(ref_audio_path):
         _log("API_ERR", f"参考音频文件不存在: {ref_audio_path}")
         return None
 
+    if protocol is None:
+        protocol = getattr(config, "TTS_PROTOCOL", config.PROTOCOL_VOXCPM2)
+
     try:
         client = TTSClient.get_client()
-        version = TTSClient.get_api_version()
-
-        if version == "1.5":
-            result = client.predict(
-                prompt=file(ref_audio_path), text=gen_text, infer_mode='普通推理',
-                max_text_tokens_per_sentence=120, sentences_bucket_max_size=4, param_5=True,
-                param_6=0.8, param_7=30, param_8=speed, param_9=0.0, param_10=3,
-                param_11=10.0, param_12=600, api_name="/gen_single"
+        if protocol == config.PROTOCOL_INDEXTTS15:
+            result = indextts_15.predict_audio(
+                client,
+                ref_audio_path,
+                gen_text,
+                speed,
+                file,
             )
-            if isinstance(result, dict):
-                return result.get("value") or result.get("path") or result.get("url")
-            if isinstance(result, str):
-                return result
-            return None
         else:
-            # v2.0: speed 由下游 rubberband 后处理对齐，此处不传入
-            # ✨ 严格类型对齐的 24 位位置参数流，int/float/bool 精确匹配后端断言
-            result = client.predict(
-                "Same as the voice reference",   # [0]
-                file(ref_audio_path),            # [1]
-                gen_text,                        # [2]
-                file(ref_audio_path),            # [3]
-                0.65,                            # [4]
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, # [5]-[12]
-                "",                              # [13]
-                False,                           # [14]
-                120,                             # [15] int
-                True,                            # [16]
-                0.8,                             # [17]
-                30,                              # [18] int
-                0.8,                             # [19]
-                0.0,                             # [20]
-                3,                               # [21] int
-                10.0,                            # [22]
-                1500,                            # [23] int
-                api_name="/gen_single"
+            result = voxcpm2.predict_audio(
+                client,
+                ref_audio_path,
+                gen_text,
+                speed,
+                file,
             )
-            if result is None:
-                return None
-            if isinstance(result, dict):
-                # Gradio FileData 字典：key 优先级 path > url > name
-                return result.get("path") or result.get("url") or result.get("name")
-            if isinstance(result, str):
-                return result  # 新版 gradio_client 可能直接返回路径字符串
-            return None
-    except Exception as e:
-        _log("API_ERR", f"API 调用失败: {e}")
+        return _extract_audio_path(result)
+    except Exception as exc:
+        _log("API_ERR", f"API 调用失败: {exc}")
         return None

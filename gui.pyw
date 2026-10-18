@@ -1,9 +1,52 @@
 import sys
 import os
+import faulthandler
+import traceback
 import json
 import threading
 import urllib.request
 import urllib.parse
+
+# ── 闪退捕获：在任何其他 import 之前安装三层安全网 ───────────
+# 1) faulthandler — 捕获 C 级崩溃（segfault / access violation），写入文件
+_CRASH_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(_CRASH_LOG_DIR, exist_ok=True)
+_CRASH_LOG_PATH = os.path.join(_CRASH_LOG_DIR, "crash.log")
+_crash_log_file = open(_CRASH_LOG_PATH, "a", encoding="utf-8")
+faulthandler.enable(file=_crash_log_file)
+
+# 2) sys.excepthook — 捕获主线程未处理异常
+def _global_excepthook(exc_type, exc_value, exc_tb):
+    msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    try:
+        _crash_log_file.write(f"\n{'='*60}\n[UNCAUGHT EXCEPTION]\n{msg}\n")
+        _crash_log_file.flush()
+    except Exception:
+        pass
+    # 也尝试写入 logger 文件（如果已初始化）
+    try:
+        from logger import error as _log_error
+        _log_error(f"UNCAUGHT: {msg}")
+    except Exception:
+        pass
+sys.excepthook = _global_excepthook
+
+# 3) threading.excepthook — 捕获非主线程未处理异常（Python 3.8+）
+def _threading_excepthook(args):
+    msg = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_tb))
+    try:
+        _crash_log_file.write(f"\n{'='*60}\n[THREAD EXCEPTION] thread={args.thread}\n{msg}\n")
+        _crash_log_file.flush()
+    except Exception:
+        pass
+    try:
+        from logger import error as _log_error
+        _log_error(f"THREAD EXCEPTION: {msg}")
+    except Exception:
+        pass
+threading.excepthook = _threading_excepthook
+# ──────────────────────────────────────────────────────────────
+
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QTextEdit, QFileDialog, QLabel, QLineEdit, QHBoxLayout,
                              QGroupBox, QProgressBar, QStyleFactory, QListWidget,
@@ -17,11 +60,6 @@ from main import process_srt_files
 from api_client import test_connection
 from logger import init_logger, set_gui_callback, log as file_log, get_log_path
 
-try:
-    from API_CLOSE import api_close
-except ImportError:
-    api_close = None
-
 # ── 本地设置持久化 ──────────────────────────────────────────
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_settings.json")
 
@@ -30,14 +68,16 @@ DEFAULT_SETTINGS = {
     "line_index": 2,
     "max_retries": 5,
     "circuit_breaker_threshold": 6,
-    "webhook_url": "https://sctapi.ftqq.com/SCT124090TODYAymp8nuHDeqleLu8oRDAS.send",
+    "wxpusher_app_token": "",
+    "wxpusher_uid": "",
     "servers": [],
-    "api_public_key": "",  # 新增：公钥
-    "api_private_key": "",  # 新增：私钥
-    "api_hostid": "",  # 新增：Host ID
+    "server_protocols": {},  # url -> "indextts_15" / "voxcpm2"
+    "server_threads_per_server": 1,  # 每台服务器并发线程数
     "merge_max_chars": 30,  # 字幕合并字数上限，0=禁用
     "background_merge": False,  # 后台合并音视频
 }
+
+_REMOVED_SETTINGS_KEYS = ("api_public_key", "api_private_key", "api_hostid")
 
 
 def load_settings() -> dict:
@@ -49,9 +89,15 @@ def load_settings() -> dict:
                 data.setdefault(k, v)
             # 旧版本按总线程数均分服务器；现在每台在线服务器固定 2 线程
             data.pop("total_threads", None)
+            # 云主机自动关机功能已移除，同时清理旧版本遗留的明文凭据。
+            had_removed_settings = any(key in data for key in _REMOVED_SETTINGS_KEYS)
+            for key in _REMOVED_SETTINGS_KEYS:
+                data.pop(key, None)
             # migrate old single-path setting
             if not data.get("srt_paths") and data.get("srt_path"):
                 data["srt_paths"] = [data["srt_path"]]
+            if had_removed_settings:
+                save_settings(data)
             return data
     except Exception:
         return dict(DEFAULT_SETTINGS)
@@ -59,28 +105,47 @@ def load_settings() -> dict:
 
 def save_settings(data: dict):
     try:
+        cleaned_data = {k: v for k, v in data.items() if k not in _REMOVED_SETTINGS_KEYS}
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(cleaned_data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         file_log("SETTINGS", f"保存失败: {e}")
 
 
-# ── Webhook 通知 ────────────────────────────────────────────
-def send_webhook(webhook_url: str, title: str, content: str):
-    """在后台线程发送 Server 酱 Webhook 通知"""
-    if not webhook_url:
+# ── WxPusher 通知 ──────────────────────────────────────────
+_WXPUSHER_API_URL = "https://wxpusher.zjiecode.com/api/send/message"
+
+
+def send_webhook(app_token: str, uid: str, title: str, content: str):
+    """在后台线程发送 WxPusher 通知"""
+    if not app_token or not uid:
         return
 
     def _send():
         try:
-            params = urllib.parse.urlencode({"title": title, "desp": content})
-            url = f"{webhook_url.rstrip('?')}?{params}"
-            req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            import json as _json
+            data = _json.dumps({
+                "appToken": app_token,
+                "content": content,
+                "summary": title[:100],
+                "contentType": 1,
+                "uids": [uid],
+            }, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                _WXPUSHER_API_URL,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
                 body = resp.read().decode("utf-8", errors="ignore")
-                file_log("WEBHOOK", f"发送成功: {resp.status}  {body[:80]}")
+                result = _json.loads(body)
+                if result.get("code") == 1000:
+                    file_log("WEBHOOK", f"WxPusher 发送成功: {title}")
+                else:
+                    file_log("WEBHOOK", f"WxPusher 发送失败: {result.get('msg')}")
         except Exception as e:
-            file_log("WEBHOOK", f"发送失败: {e}")
+            file_log("WEBHOOK", f"WxPusher 发送异常: {e}")
 
     threading.Thread(target=_send, daemon=True).start()
 
@@ -120,12 +185,11 @@ class SettingsDialog(QDialog):
                  line_index: int = 2,
                  max_retries: int = 5,
                  circuit_breaker_threshold: int = 6,
-                 webhook_url: str = "",
-                 api_public_key: str = "",
-                 api_private_key: str = "",
-                 api_hostid: str = "",
+                 wxpusher_app_token: str = "",
+                 wxpusher_uid: str = "",
                  merge_max_chars: int = 30,
-                 background_merge: bool = False):
+                 background_merge: bool = False,
+                 server_threads_per_server: int = 1):
         super().__init__(parent)
         self.setWindowTitle("⚙️  Settings")
         self.setMinimumWidth(500)
@@ -146,6 +210,17 @@ class SettingsDialog(QDialog):
         self.spin_line.setMinimumHeight(32)
         self.spin_line.setToolTip("字幕文件中翻译文本所在的行号（从0开始）")
         form.addRow("Line Index:", self.spin_line)
+
+        # Server Threads Per Server
+        self.spin_server_threads = QSpinBox()
+        self.spin_server_threads.setRange(1, 2)
+        self.spin_server_threads.setValue(server_threads_per_server)
+        self.spin_server_threads.setMinimumHeight(32)
+        self.spin_server_threads.setToolTip(
+            "每台在线服务器的生成并发线程数（推荐 1 或 2）。\n"
+            "支持 IndexTTS 1.5 与 VoxCPM 2.0 节点自动负载均衡。"
+        )
+        form.addRow("每服务器并发数:", self.spin_server_threads)
 
         # Merge Max Chars
         self.spin_merge_chars = QSpinBox()
@@ -183,54 +258,58 @@ class SettingsDialog(QDialog):
 
         # Circuit Breaker Threshold
         self.spin_cb_threshold = QSpinBox()
-        self.spin_cb_threshold.setRange(2, 50)
+        self.spin_cb_threshold.setRange(-1, 50)
         self.spin_cb_threshold.setValue(circuit_breaker_threshold)
         self.spin_cb_threshold.setMinimumHeight(32)
         self.spin_cb_threshold.setToolTip(
             "服务器熔断阈值：连续无效重连达到此次数后，服务器自动下线。\n"
+            "设为 -1 表示禁用熔断（服务器永远不会被自动下线）。\n"
             "Cloudflare 穿透环境下建议设为 6+，避免网络抖动导致误判。"
         )
         form.addRow("熔断阈值:", self.spin_cb_threshold)
 
-        # Webhook URL
-        self.webhook_input = QLineEdit(webhook_url)
-        self.webhook_input.setMinimumHeight(32)
-        self.webhook_input.setPlaceholderText("https://sctapi.ftqq.com/YOUR_KEY.send")
-        self.webhook_input.setToolTip("Server 酱 Webhook，服务器熔断或任务完成时发送通知")
-        form.addRow("Webhook URL:", self.webhook_input)
+        # WxPusher 通知
+        self.wx_app_token_input = QLineEdit(wxpusher_app_token)
+        self.wx_app_token_input.setMinimumHeight(32)
+        self.wx_app_token_input.setPlaceholderText("AT_xxx（在 WxPusher 后台获取）")
+        self.wx_app_token_input.setToolTip("WxPusher 应用 Token，留空则不发送通知")
+        form.addRow("APP Token:", self.wx_app_token_input)
 
-        # ----- 云主机 API 关机设置 -----
-        self.pub_key_input = QLineEdit(api_public_key)
-        self.pub_key_input.setMinimumHeight(32)
-        self.pub_key_input.setPlaceholderText("在此输入公钥 (留空则不调用关机)")
-        form.addRow("API 公钥:", self.pub_key_input)
-
-        self.priv_key_input = QLineEdit(api_private_key)
-        self.priv_key_input.setMinimumHeight(32)
-        self.priv_key_input.setPlaceholderText("在此输入私钥")
-        form.addRow("API 私钥:", self.priv_key_input)
-
-        self.hostid_input = QLineEdit(api_hostid)
-        self.hostid_input.setMinimumHeight(32)
-        self.hostid_input.setPlaceholderText("例如: uhost-1ojkz7p7vyrn")
-        form.addRow("API Host ID:", self.hostid_input)
-        # ---------------------------------
+        self.wx_uid_input = QLineEdit(wxpusher_uid)
+        self.wx_uid_input.setMinimumHeight(32)
+        self.wx_uid_input.setPlaceholderText("UID_xxx（关注公众号后获取）")
+        self.wx_uid_input.setToolTip("WxPusher 用户 UID，留空则不发送通知")
+        form.addRow("UID:", self.wx_uid_input)
 
         layout.addLayout(form)
 
-        # 测试 Webhook 按钮
-        test_btn = QPushButton("📡 测试 Webhook")
+        # 操作按钮区：测试 WxPusher & 清理本地缓存
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+
+        test_btn = QPushButton("📡 测试 WxPusher")
         test_btn.setObjectName("checkBtn")
         test_btn.setMinimumHeight(32)
-        test_btn.clicked.connect(self._test_webhook)
-        layout.addWidget(test_btn)
+        test_btn.clicked.connect(self._test_wxpusher)
+        btn_layout.addWidget(test_btn)
+
+        cache_btn = QPushButton("🧹 清理本地缓存")
+        cache_btn.setObjectName("checkBtn")
+        cache_btn.setMinimumHeight(32)
+        cache_btn.setToolTip("清理云盘骨架缓存与临时工作区（%TEMP%\\MultTTS_Cache）")
+        cache_btn.clicked.connect(self._clear_cache)
+        btn_layout.addWidget(cache_btn)
+
+        layout.addLayout(btn_layout)
 
         # 说明文字
         hint = QLabel(
-            "Webhook 格式: <code>https://sctapi.ftqq.com/&lt;KEY&gt;.send</code><br>"
-            "服务器熔断时会自动推送通知到你的微信。"
+            "WxPusher 微信推送通知。<br>"
+            "APP Token 和 UID 在 <a href='https://wxpusher.zjiecode.com'>WxPusher 后台</a>获取。<br>"
+            "服务器熔断或任务完成时自动推送通知到你的微信。"
         )
         hint.setTextFormat(Qt.TextFormat.RichText)
+        hint.setOpenExternalLinks(True)
         hint.setStyleSheet("color: #888; font-size: 11px;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -243,13 +322,50 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _test_webhook(self):
-        url = self.webhook_input.text().strip()
-        if not url:
-            QMessageBox.warning(self, "提示", "请先填写 Webhook URL")
+    def _test_wxpusher(self):
+        token = self.wx_app_token_input.text().strip()
+        uid = self.wx_uid_input.text().strip()
+        if not token or not uid:
+            QMessageBox.warning(self, "提示", "请先填写 APP Token 和 UID")
             return
-        send_webhook(url, "Auto Dubbing Studio 测试", "Webhook 测试消息，连接正常 ✅")
+        send_webhook(token, uid, "Auto Dubbing Studio 测试", "WxPusher 测试消息，连接正常 ✅")
         QMessageBox.information(self, "已发送", "测试通知已在后台发送，请查看微信。")
+
+    def _clear_cache(self):
+        import tempfile
+        import shutil
+        cache_dir = getattr(config, 'LOCAL_CACHE_DIR', None)
+        if not cache_dir:
+            cache_dir = os.path.join(tempfile.gettempdir(), "MultTTS_Cache")
+
+        if not os.path.exists(cache_dir):
+            QMessageBox.information(self, "缓存清理", "当前没有本地缓存需要清理。")
+            return
+
+        reply = QMessageBox.question(
+            self, "确认清理",
+            f"确定要清理本地缓存目录吗？\n\n路径: {cache_dir}\n\n清理后下次处理云盘文件时将重新同步骨架。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            total_bytes = 0
+            for root, dirs, files in os.walk(cache_dir):
+                for f in files:
+                    try:
+                        total_bytes += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+            size_mb = total_bytes / 1024 / 1024
+            shutil.rmtree(cache_dir)
+            file_log("CACHE", f"用户手动清理缓存: {cache_dir} (释放 {size_mb:.1f} MB)")
+            QMessageBox.information(self, "清理成功", f"本地缓存已清理完毕！\n释放空间: {size_mb:.1f} MB")
+        except Exception as e:
+            file_log("CACHE", f"手动清理缓存失败: {e}")
+            QMessageBox.critical(self, "清理失败", f"清理缓存时发生错误: {e}")
 
     @property
     def line_index(self) -> int:
@@ -264,20 +380,12 @@ class SettingsDialog(QDialog):
         return self.spin_cb_threshold.value()
 
     @property
-    def webhook_url(self) -> str:
-        return self.webhook_input.text().strip()
+    def wxpusher_app_token(self) -> str:
+        return self.wx_app_token_input.text().strip()
 
     @property
-    def api_public_key(self) -> str:
-        return self.pub_key_input.text().strip()
-
-    @property
-    def api_private_key(self) -> str:
-        return self.priv_key_input.text().strip()
-
-    @property
-    def api_hostid(self) -> str:
-        return self.hostid_input.text().strip()
+    def wxpusher_uid(self) -> str:
+        return self.wx_uid_input.text().strip()
 
     @property
     def merge_max_chars(self) -> int:
@@ -286,6 +394,10 @@ class SettingsDialog(QDialog):
     @property
     def background_merge(self) -> bool:
         return self.chk_background_merge.isChecked()
+
+    @property
+    def server_threads_per_server(self) -> int:
+        return self.spin_server_threads.value()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -319,17 +431,15 @@ class GuiProgressAdapter(QObject):
 # API 连接检查线程
 # ══════════════════════════════════════════════════════════════
 class CheckConnectionThread(QThread):
-    result_signal = pyqtSignal(bool, str, str)
+    result_signal = pyqtSignal(bool, str, str, str)  # (success, protocol, message, url)
 
-    def __init__(self, url):
+    def __init__(self, url: str):
         super().__init__()
         self.url = url
 
     def run(self):
-        if test_connection(self.url):
-            self.result_signal.emit(True, "Connection Successful!", self.url)
-        else:
-            self.result_signal.emit(False, "Connection Failed.", self.url)
+        ok, proto, msg = test_connection(self.url)
+        self.result_signal.emit(ok, proto, msg, self.url)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -339,16 +449,20 @@ class WorkerThread(QThread):
     finished_signal = pyqtSignal(bool)
 
     def __init__(self, srt_paths, transformers_line, adapter, server_configs: dict,
+                 server_protocols: dict = None,
                  max_retries: int = 5, circuit_breaker_threshold: int = 6,
-                 background_merge: bool = False):
+                 background_merge: bool = False,
+                 server_threads_per_server: int = 1):
         super().__init__()
         self.srt_paths = srt_paths
         self.transformers_line = transformers_line
         self.adapter = adapter
         self.server_configs = server_configs
+        self.server_protocols = server_protocols or {}
         self.max_retries = max_retries
         self.circuit_breaker_threshold = circuit_breaker_threshold
         self.background_merge = background_merge
+        self.server_threads_per_server = server_threads_per_server
 
     def run(self):
         config.USE_TQDM_PROGRESS_BAR = False
@@ -360,11 +474,13 @@ class WorkerThread(QThread):
                 transformers_line=self.transformers_line,
                 progress_callback=self.adapter,
                 server_configs=self.server_configs,
+                server_protocols=self.server_protocols,
                 on_server_down=self.adapter.notify_server_down,
                 on_all_down=self.adapter.notify_all_down,
                 max_retries=self.max_retries,
                 circuit_breaker_threshold=self.circuit_breaker_threshold,
                 background_merge=self.background_merge,
+                server_threads_per_server=self.server_threads_per_server,
             )
         except Exception as e:
             self.adapter.log(f"Critical Error in Worker: {e}")
@@ -379,11 +495,12 @@ class ServerEntryWidget(QWidget):
     remove_signal = pyqtSignal(QListWidgetItem)
     retry_signal = pyqtSignal(str)
 
-    def __init__(self, url: str, parent_item: QListWidgetItem, parent=None):
+    def __init__(self, url: str, parent_item: QListWidgetItem, protocol: str = "detecting", parent=None):
         super().__init__(parent)
         self.url = url
         self.parent_item = parent_item
         self._status = 'checking'
+        self._protocol = protocol
 
         layout = QHBoxLayout()
         layout.setContentsMargins(4, 2, 4, 2)
@@ -393,13 +510,11 @@ class ServerEntryWidget(QWidget):
         self.led.setFixedSize(12, 12)
         self.led.setStyleSheet("background-color: #f1c40f; border-radius: 6px;")
 
+        self.proto_badge = QLabel(self._format_proto_badge(protocol))
+        self._apply_proto_badge_style(protocol)
+
         self.url_label = QLabel(url)
         self.url_label.setStyleSheet("color: #ccc; font-size: 12px;")
-
-        self.thread_label = QLabel("")
-        self.thread_label.setFixedWidth(60)
-        self.thread_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.thread_label.setStyleSheet("color: #888; font-size: 11px;")
 
         self.remove_btn = QPushButton("✕")
         self.remove_btn.setFixedSize(22, 22)
@@ -410,14 +525,18 @@ class ServerEntryWidget(QWidget):
         self.remove_btn.clicked.connect(lambda: self.remove_signal.emit(self.parent_item))
 
         layout.addWidget(self.led)
+        layout.addWidget(self.proto_badge)
         layout.addWidget(self.url_label, 1)
-        layout.addWidget(self.thread_label)
         layout.addWidget(self.remove_btn)
         self.setLayout(layout)
 
     @property
     def status(self) -> str:
         return self._status
+
+    @property
+    def protocol(self) -> str:
+        return self._protocol
 
     def set_status(self, status: str):
         self._status = status
@@ -426,8 +545,37 @@ class ServerEntryWidget(QWidget):
             f"background-color: {colors.get(status, '#666')}; border-radius: 6px;"
         )
 
-    def set_thread_hint(self, n: int):
-        self.thread_label.setText(f"{n} 线程" if n > 0 else "")
+    def set_protocol(self, protocol: str):
+        self._protocol = protocol
+        self.proto_badge.setText(self._format_proto_badge(protocol))
+        self._apply_proto_badge_style(protocol)
+
+    @staticmethod
+    def _format_proto_badge(proto: str) -> str:
+        if proto == "indextts_15":
+            return "IndexTTS 1.5"
+        if proto == "voxcpm2":
+            return "VoxCPM 2.0"
+        if proto == "detecting":
+            return "Detecting..."
+        return "Unknown"
+
+    def _apply_proto_badge_style(self, proto: str):
+        if proto == "indextts_15":
+            self.proto_badge.setStyleSheet(
+                "background: #1b3a4b; color: #48cae4; border: 1px solid #0077b6; "
+                "border-radius: 3px; padding: 1px 5px; font-size: 11px; font-weight: bold;"
+            )
+        elif proto == "voxcpm2":
+            self.proto_badge.setStyleSheet(
+                "background: #2d1b4e; color: #c77dff; border: 1px solid #7b2cbf; "
+                "border-radius: 3px; padding: 1px 5px; font-size: 11px; font-weight: bold;"
+            )
+        else:
+            self.proto_badge.setStyleSheet(
+                "background: #333; color: #888; border: 1px solid #555; "
+                "border-radius: 3px; padding: 1px 5px; font-size: 11px;"
+            )
 
     def mouseDoubleClickEvent(self, event):
         self.retry_signal.emit(self.url)
@@ -469,6 +617,8 @@ class TTSApp(QWidget):
         super().__init__()
         self._server_widgets: dict = {}
         self._check_threads: list = []
+        self._server_down_webhook_generation = 0
+        self._all_down_webhook_sent = False
 
         # 加载本地设置
         self._settings = load_settings()
@@ -482,27 +632,32 @@ class TTSApp(QWidget):
         set_gui_callback(self._on_log_line)
         self.append_log(f"> 日志文件: {log_path}")
 
+        # 启动控制服务器（延迟导入，避免 main.py 依赖问题阻塞 GUI 启动）
+        try:
+            import control_server
+            control_server.set_process_runner(self._restart_pipeline)
+            control_server.start_control_server()
+        except Exception as e:
+            self.append_log(f"> 控制服务器启动失败: {e}")
+
         # 恢复上次的服务器列表
+        saved_protos = self._settings.get("server_protocols", {})
         for url in self._settings.get("servers", []):
             if url:
-                self._restore_server(url)
+                proto = saved_protos.get(url, "detecting")
+                self._restore_server(url, initial_proto=proto)
 
         # 恢复上次的文件夹列表
         for path in self._settings.get("srt_paths", []):
             if path and os.path.isdir(path):
                 self._add_folder_row(path)
 
-        # 若没有保存的服务器，用 config 默认值
-        if not self._settings.get("servers") and config.GRADIO_URL:
-            self.new_api_input.setText(config.GRADIO_URL)
-            self.add_server()
-
         # 系统托盘
         self._tray = QSystemTrayIcon(self)
         self._tray.setIcon(_make_icon("#3498db"))
         tray_menu = QMenu()
         tray_menu.addAction("显示窗口", self.showNormal)
-        tray_menu.addAction("退出", lambda: os._exit(0))
+        tray_menu.addAction("退出", lambda: self._force_exit("tray menu exit"))
         self._tray.setContextMenu(tray_menu)
         self._tray.activated.connect(self._on_tray_activated)
         self._tray.show()
@@ -510,6 +665,11 @@ class TTSApp(QWidget):
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.showNormal()
+
+    def _restart_pipeline(self):
+        """重启上次的处理流程（供 control_server 调用）。"""
+        from main import restart_last_pipeline
+        restart_last_pipeline()
 
     # ── UI 构建 ────────────────────────────────
     def initUI(self):
@@ -573,15 +733,18 @@ class TTSApp(QWidget):
         summary_layout = QHBoxLayout()
         self.lbl_line_summary = QLabel(f"Line Index: {self._settings['line_index']}")
         self.lbl_retry_summary = QLabel(f"最大重试: {self._settings.get('max_retries', 5)}")
-        self.lbl_cb_summary = QLabel(f"熔断阈值: {self._settings.get('circuit_breaker_threshold', 6)}")
+        _cb_val = self._settings.get('circuit_breaker_threshold', 6)
+        self.lbl_cb_summary = QLabel(f"熔断阈值: {'已禁用' if _cb_val < 0 else _cb_val}")
         self.lbl_merge_summary = QLabel(f"合并字数: {self._settings.get('merge_max_chars', 30)}")
+        self.lbl_threads_summary = QLabel(f"每服务器并发: {self._settings.get('server_threads_per_server', 1)}")
         self.lbl_bg_merge_summary = QLabel()
         self.lbl_webhook_summary = QLabel()
         self._refresh_summary_labels()
 
         for lbl in (self.lbl_line_summary, self.lbl_retry_summary,
                     self.lbl_cb_summary,
-                    self.lbl_merge_summary, self.lbl_bg_merge_summary,
+                    self.lbl_merge_summary, self.lbl_threads_summary,
+                    self.lbl_bg_merge_summary,
                     self.lbl_webhook_summary):
             lbl.setStyleSheet("color: #aaa; font-size: 12px;")
 
@@ -601,6 +764,8 @@ class TTSApp(QWidget):
         summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_merge_summary)
         summary_layout.addSpacing(20)
+        summary_layout.addWidget(self.lbl_threads_summary)
+        summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_bg_merge_summary)
         summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_webhook_summary)
@@ -618,7 +783,9 @@ class TTSApp(QWidget):
 
         add_row = QHBoxLayout()
         self.new_api_input = QLineEdit()
-        self.new_api_input.setPlaceholderText("e.g., http://127.0.0.1:7860~2/  （~2 表示连续添加7860~7862）")
+        self.new_api_input.setPlaceholderText(
+            "输入 TTS 服务地址 (支持 IndexTTS 1.5 / VoxCPM 2.0，可用逗号或 ~N 分隔)"
+        )
         self.new_api_input.setMinimumHeight(32)
         self.new_api_input.returnPressed.connect(self.add_server)
 
@@ -704,12 +871,11 @@ class TTSApp(QWidget):
             line_index=self._settings["line_index"],
             max_retries=self._settings.get("max_retries", 5),
             circuit_breaker_threshold=self._settings.get("circuit_breaker_threshold", 6),
-            webhook_url=self._settings.get("webhook_url", ""),
-            api_public_key=self._settings.get("api_public_key", ""),
-            api_private_key=self._settings.get("api_private_key", ""),
-            api_hostid=self._settings.get("api_hostid", ""),
+            wxpusher_app_token=self._settings.get("wxpusher_app_token", ""),
+            wxpusher_uid=self._settings.get("wxpusher_uid", ""),
             merge_max_chars=self._settings.get("merge_max_chars", 30),
             background_merge=self._settings.get("background_merge", False),
+            server_threads_per_server=self._settings.get("server_threads_per_server", 1),
         )
         # 应用暗色样式到对话框
         dlg.setStyleSheet(self.styleSheet())
@@ -717,14 +883,12 @@ class TTSApp(QWidget):
             self._settings["line_index"] = dlg.line_index
             self._settings["max_retries"] = dlg.max_retries
             self._settings["circuit_breaker_threshold"] = dlg.circuit_breaker_threshold
-            self._settings["webhook_url"] = dlg.webhook_url
+            self._settings["wxpusher_app_token"] = dlg.wxpusher_app_token
+            self._settings["wxpusher_uid"] = dlg.wxpusher_uid
 
-            # 接收新参数并保存
-            self._settings["api_public_key"] = dlg.api_public_key
-            self._settings["api_private_key"] = dlg.api_private_key
-            self._settings["api_hostid"] = dlg.api_hostid
             self._settings["merge_max_chars"] = dlg.merge_max_chars
             self._settings["background_merge"] = dlg.background_merge
+            self._settings["server_threads_per_server"] = dlg.server_threads_per_server
 
             # 同步到 config 模块
             config.MERGE_MAX_CHARS = dlg.merge_max_chars
@@ -735,40 +899,43 @@ class TTSApp(QWidget):
             self._update_thread_hints()
             self.append_log(
                 f"> Settings saved — Line Index: {dlg.line_index}, "
+                f"每服务器并发数: {dlg.server_threads_per_server}, "
                 f"最大重试: {dlg.max_retries}, "
                 f"熔断阈值: {dlg.circuit_breaker_threshold}, "
                 f"合并字数上限: {dlg.merge_max_chars}, "
                 f"后台合并: {'开' if dlg.background_merge else '关'}, "
-                f"Webhook: {'已设置' if dlg.webhook_url else '未设置'}"
+                f"WxPusher: {'已配置' if dlg.wxpusher_app_token and dlg.wxpusher_uid else '未配置'}"
             )
 
     def _refresh_summary_labels(self):
         self.lbl_line_summary.setText(f"Line Index: {self._settings['line_index']}")
         self.lbl_retry_summary.setText(f"最大重试: {self._settings.get('max_retries', 5)}")
-        self.lbl_cb_summary.setText(f"熔断阈值: {self._settings.get('circuit_breaker_threshold', 6)}")
+        _cb_val = self._settings.get('circuit_breaker_threshold', 6)
+        self.lbl_cb_summary.setText(f"熔断阈值: {'已禁用' if _cb_val < 0 else _cb_val}")
         self.lbl_merge_summary.setText(f"合并字数: {self._settings.get('merge_max_chars', 30)}")
+        self.lbl_threads_summary.setText(f"每服务器并发: {self._settings.get('server_threads_per_server', 1)}")
         bg = self._settings.get("background_merge", False)
         self.lbl_bg_merge_summary.setText(f"后台合并: {'开' if bg else '关'}")
-        wh = self._settings.get("webhook_url", "")
-        if wh:
-            # 只显示域名部分，避免泄露完整 key
-            short = wh.split("//")[-1].split("/")[0]
-            self.lbl_webhook_summary.setText(f"Webhook: {short}/…")
-        else:
-            self.lbl_webhook_summary.setText("Webhook: 未设置")
+        wx_token = self._settings.get("wxpusher_app_token", "")
+        wx_uid = self._settings.get("wxpusher_uid", "")
+        self.lbl_webhook_summary.setText(f"WxPusher: {'已配置' if wx_token and wx_uid else '未配置'}")
 
     # ── 持久化 ──────────────────────────────────
     def _save_current_settings(self):
         self._settings["srt_paths"] = list(self._folder_widgets.keys())
         self._settings["servers"] = list(self._server_widgets.keys())
+        self._settings["server_protocols"] = {
+            url: entry.protocol for url, (_, entry) in self._server_widgets.items()
+            if entry.protocol not in ("detecting", "unknown")
+        }
         save_settings(self._settings)
 
     # ── 服务器管理 ────────────────────────────────
-    def _restore_server(self, url: str):
+    def _restore_server(self, url: str, initial_proto: str = "detecting"):
         """静默恢复服务器（不弹出连接日志，直接检测）"""
         if url in self._server_widgets:
             return
-        self._add_server_row(url)
+        self._add_server_row(url, protocol=initial_proto)
         _, entry = self._server_widgets[url]
         entry.set_status('checking')
         thread = CheckConnectionThread(url)
@@ -776,34 +943,33 @@ class TTSApp(QWidget):
         self._check_threads.append(thread)
         thread.start()
 
-    def _add_server_row(self, url: str):
+    def _add_server_row(self, url: str, protocol: str = "detecting"):
         if url in self._server_widgets:
             return
         item = QListWidgetItem(self.server_list)
-        entry = ServerEntryWidget(url, item, self)
+        entry = ServerEntryWidget(url, item, protocol=protocol, parent=self)
         entry.remove_signal.connect(self._remove_server_item)
         entry.retry_signal.connect(self._retry_server_connection)
         item.setSizeHint(entry.sizeHint())
         self.server_list.addItem(item)
         self.server_list.setItemWidget(item, entry)
         self._server_widgets[url] = (item, entry)
-        self._update_thread_hints()
 
     def _update_thread_hints(self):
-        online = [(url, entry) for url, (_, entry) in self._server_widgets.items()
-                  if entry.status != 'offline']
-        for url, entry in online:
-            entry.set_thread_hint(2)
-        for url, (_, entry) in self._server_widgets.items():
-            if entry.status == 'offline':
-                entry.set_thread_hint(0)
+        pass  # 并发数现在由设置窗口统一管理
 
     def _get_server_configs(self) -> dict:
-        online = [(url, entry) for url, (_, entry) in self._server_widgets.items()
-                  if entry.status != 'offline']
+        threads = self._settings.get("server_threads_per_server", 1)
+        # 只把已经完成软探测且状态为 online 的节点交给主流程。
+        # checking 状态不再提前进入任务，避免连接检查尚未结束时重复建连。
+        online = [url for url, (_, entry) in self._server_widgets.items()
+                  if entry.status == 'online']
+        return {url: threads for url in online}
+
+    def _get_server_protocols(self) -> dict:
         return {
-            url: 2
-            for url, entry in online
+            url: entry.protocol for url, (_, entry) in self._server_widgets.items()
+            if entry.status == 'online'
         }
 
     def _update_run_btn(self):
@@ -901,18 +1067,21 @@ class TTSApp(QWidget):
 
         self._save_current_settings()
 
-    def _on_server_check_done(self, success, message, url):
+    def _on_server_check_done(self, success, protocol, message, url):
         if url not in self._server_widgets:
             return
         _, entry = self._server_widgets[url]
+        entry.set_protocol(protocol)
         if success:
             entry.set_status('online')
-            self.append_log(f"> Connected: {url}")
+            proto_name = "IndexTTS 1.5" if protocol == "indextts_15" else ("VoxCPM 2.0" if protocol == "voxcpm2" else protocol)
+            self.append_log(f"> Connected: {url} [{proto_name}]")
         else:
             entry.set_status('offline')
             self.append_log(f"> Failed: {url} — {message}")
         self._update_thread_hints()
         self._update_run_btn()
+        self._save_current_settings()
 
     def _remove_server_item(self, item: QListWidgetItem):
         widget = self.server_list.itemWidget(item)
@@ -947,6 +1116,16 @@ class TTSApp(QWidget):
         self._update_run_btn()
 
     # ── 熔断事件 ───────────────────────────────
+    def _flush_server_down_webhook(self, generation: int, msg: str):
+        """短暂延迟单节点通知；若随后全部熔断，则由总通知取代。"""
+        if generation != self._server_down_webhook_generation or self._all_down_webhook_sent:
+            return
+        send_webhook(
+            self._settings.get("wxpusher_app_token", ""),
+            self._settings.get("wxpusher_uid", ""),
+            "⚠️ 配音服务器熔断", msg
+        )
+
     def _on_server_down(self, url: str, stats: str):
         """某台服务器触发熔断时调用"""
         msg = f"⚠️ 服务器熔断: {url}\n统计: {stats}"
@@ -958,12 +1137,14 @@ class TTSApp(QWidget):
             QSystemTrayIcon.MessageIcon.Warning,
             6000
         )
-        # Webhook 通知
-        webhook = self._settings.get("webhook_url", "")
-        send_webhook(webhook, "⚠️ 配音服务器熔断", msg)
+        self._server_down_webhook_generation += 1
+        generation = self._server_down_webhook_generation
+        QTimer.singleShot(800, lambda: self._flush_server_down_webhook(generation, msg))
 
     def _on_all_servers_down(self):
         """所有服务器均熔断时调用"""
+        self._server_down_webhook_generation += 1  # 取消尚未发送的单节点通知
+        self._all_down_webhook_sent = True
         msg = "🔴 所有服务器均已熔断，任务已停止！请检查 API 服务状态。"
         self.append_log(f"\n>>> {msg}")
         _play_sound("abort")
@@ -974,8 +1155,11 @@ class TTSApp(QWidget):
             QSystemTrayIcon.MessageIcon.Critical,
             8000
         )
-        webhook = self._settings.get("webhook_url", "")
-        send_webhook(webhook, "🔴 配音全部服务器熔断", msg)
+        send_webhook(
+            self._settings.get("wxpusher_app_token", ""),
+            self._settings.get("wxpusher_uid", ""),
+            "🔴 配音全部服务器熔断", msg
+        )
         QTimer.singleShot(8000, lambda: self._tray.setIcon(_make_icon("#3498db")))
 
     # ── 其他控件 ───────────────────────────────
@@ -998,14 +1182,24 @@ class TTSApp(QWidget):
         line_idx = self._settings.get("line_index", 2)
         config.MERGE_MAX_CHARS = self._settings.get("merge_max_chars", 30)
         server_configs = self._get_server_configs()
+        server_protocols = self._get_server_protocols()
         if not server_configs:
-            self.append_log("Error: No online servers available.")
+            msg = (
+                "未配置可用的 TTS 服务地址。\n\n"
+                "请先在 API Servers 中点击 Add & Connect 添加 IndexTTS 1.5 或 VoxCPM 2.0 服务地址，"
+                "连接成功后再开始配音。"
+            )
+            self.append_log("> " + msg.replace("\n", " "))
+            QMessageBox.warning(self, "缺少 TTS 服务地址", msg)
             return
 
         srt_paths = list(self._folder_widgets.keys())
         if not srt_paths:
             self.append_log("Error: No folders added.")
             return
+
+        self._server_down_webhook_generation += 1
+        self._all_down_webhook_sent = False
 
         self.run_btn.setEnabled(False)
         self.run_btn.setText("PROCESSING...")
@@ -1021,16 +1215,20 @@ class TTSApp(QWidget):
         for p in srt_paths:
             self.append_log(f"  · {p}")
         for u, n in server_configs.items():
-            self.append_log(f"  · {u}  线程数: {n}")
+            proto = server_protocols.get(u, 'voxcpm2')
+            proto_label = "IndexTTS 1.5" if proto == "indextts_15" else ("VoxCPM 2.0" if proto == "voxcpm2" else proto)
+            self.append_log(f"  · {u} [{proto_label}]  线程数: {n}")
 
         self.worker = WorkerThread(
             srt_paths=srt_paths,
             transformers_line=line_idx,
             adapter=self.adapter,
             server_configs=server_configs,
+            server_protocols=server_protocols,
             max_retries=self._settings.get("max_retries", 5),
             circuit_breaker_threshold=self._settings.get("circuit_breaker_threshold", 6),
             background_merge=self._settings.get("background_merge", False),
+            server_threads_per_server=self._settings.get("server_threads_per_server", 1),
         )
         self.worker.finished_signal.connect(self.process_finished)
         self.worker.start()
@@ -1077,12 +1275,19 @@ class TTSApp(QWidget):
             tray_icon = _make_icon("#2ecc71")
             log_msg = "\n>>> ✅ All tasks completed."
             sound = "finish"
-        else:
+        elif config.ABORT_ALL:
             msg = "⚠️ 任务已中止"
             detail = "配音流程被停止，已完成部分已保存。"
             icon = QSystemTrayIcon.MessageIcon.Warning
             tray_icon = _make_icon("#e67e22")
             log_msg = "\n>>> ⚠️ Workflow aborted."
+            sound = "abort"
+        else:
+            msg = "❌ 任务未完全完成"
+            detail = "至少一个文件处理失败；本地缓存已保留，请查看日志中的失败原因。"
+            icon = QSystemTrayIcon.MessageIcon.Warning
+            tray_icon = _make_icon("#e67e22")
+            log_msg = "\n>>> ❌ Workflow finished with errors."
             sound = "abort"
 
         self.append_log(log_msg)
@@ -1090,25 +1295,15 @@ class TTSApp(QWidget):
         self._tray.setIcon(tray_icon)
         self._tray.showMessage("Auto Dubbing Studio", f"{msg}\n{detail}", icon, 6000)
 
-        # ── 新的动态关闭逻辑 ─────────────────────────────────────
-        pub_key = self._settings.get("api_public_key", "")
-        priv_key = self._settings.get("api_private_key", "")
-        host_id = self._settings.get("api_hostid", "")
-
-        # 只有当 api_close 函数存在，且用户输入了这三个值时，才触发关机
-        if api_close and pub_key and priv_key and host_id:
-            try:
-                self.append_log(f"\n>>> 🔌 正在调用 API 关闭云主机 ({host_id})...")
-                api_close(pub_key, priv_key, host_id)
-            except Exception as e:
-                self.append_log(f"\n>>> ⚠️ 调用 api_close 失败: {e}")
-        # ───────────────────────────────────────────────────────
-
-        # Webhook 完成通知
-        webhook = self._settings.get("webhook_url", "")
+        # WxPusher 完成通知
         srt_paths = list(self._folder_widgets.keys())
         path_str = ", ".join(srt_paths) if srt_paths else "无"
-        send_webhook(webhook, msg, f"{detail}\n路径: {path_str}")
+        if not self._all_down_webhook_sent:
+            send_webhook(
+                self._settings.get("wxpusher_app_token", ""),
+                self._settings.get("wxpusher_uid", ""),
+                msg, f"{detail}\n路径: {path_str}"
+            )
         try:
             self._tray.messageClicked.disconnect()
         except TypeError:
@@ -1193,11 +1388,29 @@ class TTSApp(QWidget):
         self.raise_()
         self.activateWindow()
 
-    def closeEvent(self, event):
-        self._save_current_settings()
+    def _force_exit(self, reason: str):
+        try:
+            self._save_current_settings()
+        except Exception as e:
+            try:
+                file_log("GUI_EXIT", f"保存设置失败: {e}")
+            except Exception:
+                pass
+
         config.ABORT_ALL = True
-        self._tray.hide()
+        try:
+            file_log("GUI_EXIT", f"强制退出 GUI: {reason}")
+        except Exception:
+            pass
+
+        try:
+            self._tray.hide()
+        except Exception:
+            pass
         os._exit(0)
+
+    def closeEvent(self, event):
+        self._force_exit("window closeEvent")
 
 
 if __name__ == '__main__':

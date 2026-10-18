@@ -1,10 +1,12 @@
 @echo off
-title Auto Dubbing Studio
-:: 切换到 .bat 文件所在目录
 cd /d "%~dp0"
 
-:: 使用 python.exe 启动（保留控制台以便查看错误信息）
-:: 如果用 pythonw.exe 则任何启动崩溃都看不到
-".venv\Scripts\python.exe" "gui.pyw"
+if not exist ".venv\Scripts\pythonw.exe" (
+    echo ERROR: .venv\Scripts\pythonw.exe was not found.
+    echo Please create or repair the project virtual environment first.
+    pause
+    exit /b 1
+)
 
-pause
+start "" ".venv\Scripts\pythonw.exe" "%~dp0gui.pyw"
+exit /b 0

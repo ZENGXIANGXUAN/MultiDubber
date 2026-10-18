@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.139.0",
     "gradio-client>=2.3.0",
     "joblib>=1.5.3",
     "numpy>=2.4.3",
@@ -14,4 +15,5 @@ dependencies = [
     "soundfile>=0.13.1",
     "tqdm>=4.67.3",
     "ucloud-sdk-python3>=0.11.89",
+    "uvicorn>=0.50.2",
 ]

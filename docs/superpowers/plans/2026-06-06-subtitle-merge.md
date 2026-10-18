@@ -360,7 +360,7 @@ DEFAULT_SETTINGS = {
     "line_index": 2,
     "total_threads": 6,
     "max_retries": 3,
-    "webhook_url": "https://sctapi.ftqq.com/SCT124090TODYAymp8nuHDeqleLu8oRDAS.send",
+    "webhook_url": "",
     "servers": [],
     "api_public_key": "",
     "api_private_key": "",

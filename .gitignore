@@ -1,6 +1,3 @@
-# 忽略 API 密钥相关的文件
-API_CLOSE.py
-
 # Python
 __pycache__/
 *.py[cod]
