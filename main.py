@@ -26,7 +26,7 @@ from config import (
     TRANSFORMERS_LINE, USE_TQDM_PROGRESS_BAR, model_lock, status_lock
 )
 from logger import log as logger_log
-from utils import load_status, save_status, clear_status, time_str_to_seconds
+from utils import load_status, save_status, clear_status, time_str_to_seconds, is_valid_audio_segment
 from subtitle_parser import parse_subtitles, merge_contiguous_subtitles
 from subtitle_preprocessor import preprocess_srt_content, preprocess_text
 from audio_processor import (
@@ -355,18 +355,15 @@ def _recover_last_ref(current_tmp_dir, uncompleted_indices, log):
 
 
 def _count_existing_segments(current_tmp_dir: str) -> int:
-    """扫描临时目录中已存在的 output_*.wav 片段数量（大小 > 1000 字节视为有效）。"""
+    """扫描临时目录中已存在的有效 output_*.wav 片段数量（非纯静音）。"""
     if not os.path.isdir(current_tmp_dir):
         return 0
     count = 0
     try:
         for f in os.listdir(current_tmp_dir):
             if f.startswith("output_") and f.endswith(".wav"):
-                try:
-                    if os.path.getsize(os.path.join(current_tmp_dir, f)) > 1000:
-                        count += 1
-                except OSError:
-                    pass
+                if is_valid_audio_segment(os.path.join(current_tmp_dir, f)):
+                    count += 1
     except OSError:
         pass
     return count
@@ -989,18 +986,42 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                 completed_indices = load_status(local_status_file, srt_file)
                 all_indices = list(range(len(parsed_subtitles)))
 
+                # 校验从 status.json 加载的已完成索引：若对应文件不存在或全静音，则剔除
+                purged_silent_count = 0
+                valid_completed_indices = set()
+                for idx in completed_indices:
+                    wav_path = os.path.join(current_tmp_dir, f"output_{idx}.wav")
+                    if is_valid_audio_segment(wav_path):
+                        valid_completed_indices.add(idx)
+                    else:
+                        purged_silent_count += 1
+                        if os.path.exists(wav_path):
+                            try:
+                                os.remove(wav_path)
+                            except OSError:
+                                pass
+                completed_indices = valid_completed_indices
+                if purged_silent_count > 0:
+                    log(f"  -> [恢复系统] 检测并剔除了 {purged_silent_count} 个损坏或纯静音片段，将重新生成")
+
                 recovered_count = 0
                 for idx in all_indices:
                     if idx not in completed_indices:
                         potential_wav = os.path.join(current_tmp_dir, f"output_{idx}.wav")
-                        if os.path.exists(potential_wav) and os.path.getsize(potential_wav) > 1000:
+                        if is_valid_audio_segment(potential_wav):
                             completed_indices.add(idx)
                             recovered_count += 1
-                if recovered_count > 0:
+                        elif os.path.exists(potential_wav):
+                            # 大小异常或纯静音文件直接删除，避免遗留
+                            try:
+                                os.remove(potential_wav)
+                            except OSError:
+                                pass
+                if recovered_count > 0 or purged_silent_count > 0:
                     total_tasks_for_log = len(all_indices)
                     done_count = len(completed_indices)
                     remaining = total_tasks_for_log - done_count
-                    log(f"  -> [恢复系统] 扫描到 {recovered_count} 个已存在片段 | "
+                    log(f"  -> [恢复系统] 扫描到 {recovered_count} 个已存在有效片段 | "
                         f"进度: {done_count}/{total_tasks_for_log} ({done_count * 100 // total_tasks_for_log}%) | "
                         f"剩余: {remaining} 个")
                     save_status(local_status_file, srt_file, completed_indices)
@@ -1029,7 +1050,7 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
 
                         # ── CPU Worker 注入：rubberband/pydub + 状态保存 ──
                         def post_process_fn(idx, raw_path, server_url):
-                            if config.ABORT_ALL:
+                            if config.ABORT_ALL or (dispatcher and dispatcher.all_servers_down):
                                 return
                             params = task_params_map.get(idx)
                             if params is None:
@@ -1050,7 +1071,7 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                         # ── CPU Worker 注入：进度日志 ──
                         def done_callback(idx, server_url):
                             nonlocal completed_count, session_processed_count
-                            if config.ABORT_ALL:
+                            if config.ABORT_ALL or (dispatcher and dispatcher.all_servers_down):
                                 return
                             with status_lock:
                                 completed_count += 1

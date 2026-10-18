@@ -35,6 +35,27 @@ def clear_status(status_file: str) -> None:
         except OSError as e:
             _log("WARN", f"无法删除状态文件 '{status_file}'。错误: {e}")
 
+
+def is_valid_audio_segment(file_path: str) -> bool:
+    """
+    检查音频片段是否有效（大小 > 1000 字节，且非全静音文件）。
+    用于断点恢复，防止异常中断或熔断产生的静音占位符被误认为已完成。
+    """
+    try:
+        if not os.path.isfile(file_path) or os.path.getsize(file_path) <= 1000:
+            return False
+        with open(file_path, "rb") as f:
+            f.seek(44)  # 跳过标准 WAV 头部
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                if any(chunk):
+                    return True
+        return False
+    except Exception:
+        return False
+
 # === 核心修复：定义防弹窗标志 ===
 def get_subprocess_flags() -> int:
     """获取用于隐藏控制台窗口的标志 (仅限 Windows)"""

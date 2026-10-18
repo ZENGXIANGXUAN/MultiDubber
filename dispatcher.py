@@ -558,14 +558,10 @@ class MultiServerDispatcher:
                 self._gpu_queue.task_done()
                 if task is _SENTINEL: continue
                 abandoned += 1
-                self._cpu_queue.put(_CpuTask(
-                    task.task_id, None, "",
-                    task.post_process_fn, task.done_callback
-                ))
         except queue.Empty:
             pass
         if abandoned:
-            _log("STOP", f"已将 {abandoned} 个未处理任务转为静音占位")
+            _log("STOP", f"调度器已停止，队列中 {abandoned} 个未完成任务已安全释放（保持未完成状态，供下次断点恢复）。")
 
         for t in self._cpu_worker_threads:
             if t.is_alive():
@@ -715,10 +711,8 @@ class MultiServerDispatcher:
                             has_active = bool(self._active_servers)
 
                         if not has_active or self._abort_event.is_set():
-                            self._cpu_queue.put(_CpuTask(
-                                task.task_id, None, url,
-                                task.post_process_fn, task.done_callback
-                            ))
+                            # 所有服务器均已下线或已终止：保留未完成状态，严禁转静音占位！
+                            _log("CIRCUIT_DROP", f"无可用活跃服务器，Task {task.task_id} 保持未完成状态（供下次恢复）。")
                         else:
                             task.is_requeued = True
                             task.network_retry_count = 0  # 重置网络尝试计数，交给其他可用节点接替
@@ -727,10 +721,11 @@ class MultiServerDispatcher:
                             try:
                                 self._gpu_queue.put(task, timeout=2.0)
                             except Exception:
-                                self._cpu_queue.put(_CpuTask(
-                                    task.task_id, None, url,
-                                    task.post_process_fn, task.done_callback
-                                ))
+                                time.sleep(0.5)
+                                try:
+                                    self._gpu_queue.put(task, timeout=2.0)
+                                except Exception:
+                                    _log("WARN", f"Task {task.task_id} 重新入队超时，保持未完成状态。")
                         if task_from_queue:
                             self._gpu_queue.task_done()
                         break
@@ -738,25 +733,32 @@ class MultiServerDispatcher:
                     # 网络/连接错误：不消耗配音失败次数，但必须有独立上限，避免无限卡死。
                     if fail_kind == _FAIL_NETWORK:
                         if self._abort_event.is_set():
-                            self._cpu_queue.put(_CpuTask(
-                                task.task_id, None, url,
-                                task.post_process_fn, task.done_callback
-                            ))
                             if task_from_queue:
                                 self._gpu_queue.task_done()
                             break
 
                         task.network_retry_count += 1
                         if task.network_retry_count >= MAX_NETWORK_ATTEMPTS_PER_TASK:
-                            _log(
-                                "NET_DROP",
-                                f"Task {task.task_id} 网络/SSL连续 {MAX_NETWORK_ATTEMPTS_PER_TASK} 次失败，"
-                                f"转静音占位，避免队列无限重试。"
-                            )
-                            self._cpu_queue.put(_CpuTask(
-                                task.task_id, None, url,
-                                task.post_process_fn, task.done_callback
-                            ))
+                            with self._server_lock:
+                                other_servers = [s for s in self._active_servers if s != url]
+                            if other_servers and not self._abort_event.is_set():
+                                _log(
+                                    "NET_MIGRATE",
+                                    f"Task {task.task_id} 在节点 {url} 连续网络失败 {MAX_NETWORK_ATTEMPTS_PER_TASK} 次，"
+                                    f"重新入队调度至其他存活节点。"
+                                )
+                                task.is_requeued = True
+                                task.network_retry_count = 0
+                                task.enqueue_time = time.time()
+                                try:
+                                    self._gpu_queue.put(task, timeout=2.0)
+                                except Exception:
+                                    _log("WARN", f"Task {task.task_id} 跨节点重新入队超时，保持未完成状态。")
+                            else:
+                                _log(
+                                    "NET_HOLD",
+                                    f"Task {task.task_id} 网络重试达到上限且无其他可用节点，保持未完成状态（不写入静音占位）。"
+                                )
                             if task_from_queue:
                                 self._gpu_queue.task_done()
                             continue
@@ -803,32 +805,29 @@ class MultiServerDispatcher:
                             if task_from_queue:
                                 self._gpu_queue.task_done()
                         else:
+                            if self._abort_event.is_set():
+                                if task_from_queue:
+                                    self._gpu_queue.task_done()
+                                break
+                            _log("API_DROP", f"Task {task.task_id} 配音重试超限 ({self.max_retries} 次)，降级为静音占位。")
                             self._cpu_queue.put(_CpuTask(
                                 task.task_id, None, url,
                                 task.post_process_fn, task.done_callback
                             ))
                             if task_from_queue:
                                 self._gpu_queue.task_done()
-                            if self._abort_event.is_set():
-                                break
 
         # 退出循环后兜底回收未处理的 local_retry_task
         if local_retry_task is not None:
             with self._server_lock:
                 has_active = bool(self._active_servers)
             if not has_active or self._abort_event.is_set():
-                self._cpu_queue.put(_CpuTask(
-                    local_retry_task.task_id, None, url,
-                    local_retry_task.post_process_fn, local_retry_task.done_callback
-                ))
+                _log("WORKER_EXIT", f"节点退出，Task {local_retry_task.task_id} 保持未完成状态。")
             else:
                 try:
                     self._gpu_queue.put(local_retry_task, timeout=1.0)
                 except Exception:
-                    self._cpu_queue.put(_CpuTask(
-                        local_retry_task.task_id, None, url,
-                        local_retry_task.post_process_fn, local_retry_task.done_callback
-                    ))
+                    _log("WARN", f"Task {local_retry_task.task_id} 退出兜底入队超时，保持未完成状态。")
             local_retry_task = None
 
     def _cpu_worker_loop(self):
