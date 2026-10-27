@@ -367,3 +367,32 @@ DELETE /api/pool/servers?url=...
 - **D2**：运行中是否允许改 `server_threads_per_server`？建议：不允许（`settings_btn` 继续禁用），只对后续新增节点用当前值。
 - **D3**：是否需要 `control_server` 的池接口？建议：P2 再做，先保证 GUI 路径稳定。
 - **D4**：删除节点后 `server_protocols` 是否清理？建议：不清理（在途任务的后处理仍需要），地图规模远小于内存压力。
+
+## 12. 实现记录（2026-10-27）
+
+已按默认决策（D1 算中止、D2 Settings 继续禁用、D3 暂不做 HTTP 接口、D4 保留协议）落地。
+
+### 代码落点
+
+- `dispatcher.py`
+  - 模块级：`LIVE_POOL_ENABLED`、`normalize_url`、`sanitize_threads`、`set/get/clear_active_dispatcher`、
+    `runtime_add_server` / `runtime_remove_server`。
+  - `MultiServerDispatcher`：`_gpu_workers`、`_worker_stop`、`_spawn_lock`、`_pool_state`、`_pool_available`、
+    `_shutdown`、`add_server` / `remove_server` / `_spawn_server_workers` / `_join_workers` /
+    `get_protocol` / `pool_snapshot` / `_notify_pool_changed`。
+  - worker 侧：0.5s 轮询、取到任务后再查一次停止信号（防止摘除瞬间漏派）、在途任务照常完成、
+    退出时关闭线程本地 Client；`run_feeder` 增加空池挂起分支；`stop()` 使用 5s 全局截止并清空注册表。
+- `main.py`：`on_pool_changed` 同步日志与 `runtime_state`；后处理用 `dispatcher.get_protocol(url)` 实时查协议。
+- `gui.pyw`：运行中保持 `Add & Connect` 可用；探测成功后 `runtime_add_server`；✕ 调 `runtime_remove_server`；
+  探测线程结束后从列表移除；日志框限制 5000 行；熔断节点 UI 标红。
+- `runtime_state.py`：`update_job_servers` 把最新池写回 `last_job_context`，`/api/pipeline/restart` 不再用启动快照。
+- 测试：`tests/test_dynamic_pool.py`（6 例）、`tests/test_merge_audio.py`（4 例）、`tests/test_status_file.py`（1 例），
+  `python -m unittest discover -s tests` 全绿；另做过 10 轮 add/remove 交错压测，无丢任务/死锁。
+
+### 与方案的差异
+
+- 删除节点时 `server_configs` 会同步移除，`server_protocols` 保留（在途后处理需要）。
+- `stop()` 不再逐线程 3s，而是全局 5s；未退出的 worker 由 daemon 线程后台收尾。
+- 队列容量随 `sum(threads) * queue_depth_mul` 动态调整（只影响背压）。
+- 节点被摘除后，若 worker 恰好从 `get()` 取到任务，会在处理前检查停止信号并把任务放回队列。
+- 未实现"强制掐断在途 HTTP 请求"：删除只保证不再派新任务，正在推理的那一次会跑完。

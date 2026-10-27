@@ -58,6 +58,7 @@ from PyQt6.QtGui import QPalette, QColor, QIcon, QPixmap, QPainter, QBrush, QCur
 import config
 from main import process_srt_files
 from api_client import test_connection
+from dispatcher import runtime_add_server, runtime_remove_server
 from logger import init_logger, set_gui_callback, log as file_log, get_log_path
 
 # ── 本地设置持久化 ──────────────────────────────────────────
@@ -777,7 +778,7 @@ class TTSApp(QWidget):
         main_layout.addWidget(settings_group)
 
         # ── API Servers ────────────────────────
-        server_group = QGroupBox("API Servers  (支持多台，动态分发任务)")
+        server_group = QGroupBox("API Servers  (支持多台，动态分发；运行中可增删节点)")
         server_layout = QVBoxLayout()
         server_layout.setSpacing(8)
 
@@ -848,6 +849,8 @@ class TTSApp(QWidget):
         self.log_output = QTextEdit()
         self.log_output.setObjectName("logOutput")
         self.log_output.setReadOnly(True)
+        # 长跑时限制保留行数，避免 QTextEdit 无限增长拖慢 UI。
+        self.log_output.document().setMaximumBlockCount(5000)
         log_layout.addWidget(self.log_output)
         log_group.setLayout(log_layout)
         main_layout.addWidget(log_group)
@@ -938,10 +941,22 @@ class TTSApp(QWidget):
         self._add_server_row(url, protocol=initial_proto)
         _, entry = self._server_widgets[url]
         entry.set_status('checking')
+        self._start_check_thread(url)
+
+    def _start_check_thread(self, url: str):
+        """启动一次连接探测，并在结束后从列表中移除线程对象。"""
         thread = CheckConnectionThread(url)
         thread.result_signal.connect(self._on_server_check_done)
+        thread.finished.connect(lambda t=thread: self._discard_check_thread(t))
         self._check_threads.append(thread)
         thread.start()
+        return thread
+
+    def _discard_check_thread(self, thread):
+        try:
+            self._check_threads.remove(thread)
+        except ValueError:
+            pass
 
     def _add_server_row(self, url: str, protocol: str = "detecting"):
         if url in self._server_widgets:
@@ -989,10 +1004,7 @@ class TTSApp(QWidget):
         _, entry = self._server_widgets[url]
         entry.set_status('checking')
         self.append_log(f"> 重新连接: {url} ...")
-        thread = CheckConnectionThread(url)
-        thread.result_signal.connect(self._on_server_check_done)
-        self._check_threads.append(thread)
-        thread.start()
+        self._start_check_thread(url)
 
     def _parse_server_urls(self, raw: str) -> list[str]:
         """
@@ -1056,10 +1068,7 @@ class TTSApp(QWidget):
             self.append_log(f"> Connecting to {url} ...")
             _, entry = self._server_widgets[url]
             entry.set_status('checking')
-            thread = CheckConnectionThread(url)
-            thread.result_signal.connect(self._on_server_check_done)
-            self._check_threads.append(thread)
-            thread.start()
+            self._start_check_thread(url)
             added += 1
 
         if added > 1:
@@ -1076,6 +1085,13 @@ class TTSApp(QWidget):
             entry.set_status('online')
             proto_name = "IndexTTS 1.5" if protocol == "indextts_15" else ("VoxCPM 2.0" if protocol == "voxcpm2" else protocol)
             self.append_log(f"> Connected: {url} [{proto_name}]")
+            # 流程运行中：直接加入活跃服务器池，无需重启。
+            try:
+                if runtime_add_server(url, protocol,
+                                     self._settings.get("server_threads_per_server", 1)):
+                    self.append_log(f"> 已动态加入运行中的服务器池: {url}")
+            except Exception as e:
+                self.append_log(f"> 动态加入服务器池失败: {e}")
         else:
             entry.set_status('offline')
             self.append_log(f"> Failed: {url} — {message}")
@@ -1090,6 +1106,12 @@ class TTSApp(QWidget):
         self.server_list.takeItem(row)
         if url and url in self._server_widgets:
             del self._server_widgets[url]
+        if url:
+            try:
+                if runtime_remove_server(url):
+                    self.append_log(f"> 已从运行中的服务器池摘除: {url}（在途任务完成后退出）")
+            except Exception as e:
+                self.append_log(f"> 动态摘除服务器失败: {e}")
         self._update_thread_hints()
         self._update_run_btn()
         self._save_current_settings()
@@ -1128,6 +1150,8 @@ class TTSApp(QWidget):
 
     def _on_server_down(self, url: str, stats: str):
         """某台服务器触发熔断时调用"""
+        if url in self._server_widgets:
+            self._server_widgets[url][1].set_status('offline')
         msg = f"⚠️ 服务器熔断: {url}\n统计: {stats}"
         self.append_log(f"\n>>> {msg}")
         _play_sound("abort")
@@ -1204,7 +1228,7 @@ class TTSApp(QWidget):
         self.run_btn.setEnabled(False)
         self.run_btn.setText("PROCESSING...")
         self.add_folder_btn.setEnabled(False)
-        self.add_btn.setEnabled(False)
+        # Add & Connect 在运行中保持可用：探测成功后会把节点热加入当前池。
         self.settings_btn.setEnabled(False)
         self.log_output.clear()
         self.bar_total_progress.setValue(0)

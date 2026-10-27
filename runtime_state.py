@@ -80,6 +80,22 @@ def mark_server_active(url):
         down_servers.pop(url, None)
 
 
+def update_job_servers(server_configs, server_protocols=None):
+    """运行中增删节点后，把最新池同步到状态与重启上下文。"""
+    global last_job_context, all_servers_down
+    with _lock:
+        if last_job_context is not None:
+            last_job_context["server_configs"] = dict(server_configs or {})
+            if server_protocols is not None:
+                last_job_context["server_protocols"] = dict(server_protocols)
+        active_servers.clear()
+        active_servers.update((server_configs or {}).keys())
+        for url in list(active_servers):
+            down_servers.pop(url, None)
+        if active_servers:
+            all_servers_down = False
+
+
 def reset_before_pipeline_restart():
     """重启整条流程前重置状态。"""
     global all_servers_down, stop_reason, restart_running

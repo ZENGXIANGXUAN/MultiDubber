@@ -52,7 +52,6 @@ if os.name == 'nt':  # 仅限 Windows
 
 # 必须在补丁应用之后再导入这些库
 from pydub import AudioSegment
-from pydub import AudioSegment
 import soundfile as sf
 import pyrubberband as rb
 
@@ -217,9 +216,11 @@ def extract_single_audio(video_path, audio_output_path):
         # 确保目录存在
         os.makedirs(os.path.dirname(audio_output_path), exist_ok=True)
 
+        # 参考音频只用于裁剪片段，最终会被统一转成 24kHz 单声道；
+        # 直接按目标格式抽取，可把长视频的常驻内存/磁盘降到 1/3.7。
         ffmpeg_cmd = [
             'ffmpeg', '-i', video_path, '-vn', '-acodec', 'pcm_s16le',
-            '-ar', '44100', '-ac', '2', audio_output_path, '-y'
+            '-ar', '24000', '-ac', '1', audio_output_path, '-y'
         ]
 
         # 全局补丁会自动处理这里的弹窗
@@ -295,25 +296,98 @@ def adjust_duration_with_rubberband(input_path: str, output_path: str, target_du
         shutil.copy(input_path, output_path)
 
 
+_SF_SAMPLE_WIDTH = {
+    "PCM_S8": 1, "PCM_U8": 1, "PCM_16": 2, "PCM_24": 3, "PCM_32": 4,
+    "FLOAT": 4, "DOUBLE": 8, "ALAW": 1, "ULAW": 1,
+}
+
+
+def _probe_audio_format(path: str):
+    """只读文件头，返回 (channels, frame_rate, sample_width)；失败返回 None。"""
+    try:
+        info = sf.info(path)
+    except Exception:
+        return None
+    width = _SF_SAMPLE_WIDTH.get(str(info.subtype).upper())
+    if not width or info.samplerate <= 0 or info.channels <= 0:
+        return None
+    return int(info.channels), int(info.samplerate), int(width)
+
+
 def merge_audio(parsed_subtitles: List[List], current_tmp_dir: str) -> AudioSegment:
-    merged_audio = AudioSegment.empty()
-    if not parsed_subtitles: return merged_audio
+    if not parsed_subtitles:
+        return AudioSegment.empty()
+
     total = len(parsed_subtitles)
     logger_log("MERGE", f"开始合并音频片段 ({total} 段)")
+
+    # 1) 扫 header 求目标格式，保持原“取最大 channels/frame_rate/sample_width”语义。
+    #    只读文件头，不整段解码。
+    target_format = None
+    for i in range(total):
+        fmt = _probe_audio_format(os.path.join(current_tmp_dir, f"output_{i}.wav"))
+        if fmt is None:
+            continue
+        if target_format is None:
+            target_format = fmt
+        else:
+            target_format = (
+                max(target_format[0], fmt[0]),
+                max(target_format[1], fmt[1]),
+                max(target_format[2], fmt[2]),
+            )
+
+    channels, frame_rate, sample_width = target_format or (1, 1, 1)
+    frame_bytes = max(1, channels * sample_width)
+
+    # 2) 逐段收集 raw bytes，最后一次性构造。
+    #    原实现 `merged_audio += segment` 每次重拷已累积音频，复杂度 O(n²)。
+    chunks: List[bytes] = []
+    cursor_frames = 0
+
     for i, subtitle in enumerate(parsed_subtitles):
         start_ms, end_ms = _subtitle_ms_bounds(subtitle)
-        target_duration_ms = end_ms - start_ms
-        if len(merged_audio) < start_ms:
-            merged_audio += AudioSegment.silent(duration=start_ms - len(merged_audio))
+        target_duration_ms = max(0, end_ms - start_ms)
+
+        # 用“实际已写入的帧数”对齐到目标起点，避免长时间累积漂移。
+        start_frame = int(round(start_ms * frame_rate / 1000.0))
+        if start_frame > cursor_frames:
+            chunks.append(b"\x00" * ((start_frame - cursor_frames) * frame_bytes))
+
         segment_file = os.path.join(current_tmp_dir, f"output_{i}.wav")
-        try:
-            audio_segment = AudioSegment.from_file(segment_file)
-            merged_audio += _fit_audio_segment(audio_segment, target_duration_ms)
-        except Exception as e:
-            logger_log("MERGE", f"!! 无法读取 {segment_file} ({e})，用静音代替。")
-            merged_audio += AudioSegment.silent(duration=target_duration_ms)
+        data = b""
+        if os.path.exists(segment_file):
+            try:
+                audio_segment = AudioSegment.from_file(segment_file)
+                if audio_segment.channels != channels:
+                    audio_segment = audio_segment.set_channels(channels)
+                if audio_segment.frame_rate != frame_rate:
+                    audio_segment = audio_segment.set_frame_rate(frame_rate)
+                if audio_segment.sample_width != sample_width:
+                    audio_segment = audio_segment.set_sample_width(sample_width)
+                data = audio_segment.raw_data
+            except Exception as e:
+                logger_log("MERGE", f"!! 无法读取 {segment_file} ({e})，用静音代替。")
+
+        want_frames = int(round(target_duration_ms * frame_rate / 1000.0))
+        have_frames = len(data) // frame_bytes
+        if have_frames > want_frames:
+            data = data[: want_frames * frame_bytes]
+        elif have_frames < want_frames:
+            data += b"\x00" * ((want_frames - have_frames) * frame_bytes)
+
+        chunks.append(data)
+        cursor_frames = max(cursor_frames, start_frame + want_frames)
+
         # 每 5 段或最后一段汇报进度
         if (i + 1) % 5 == 0 or i + 1 == total:
             logger_log("MERGE", f"合并进度: {i + 1}/{total} ({(i + 1) * 100 // total}%)")
+
+    merged_audio = AudioSegment(
+        data=b"".join(chunks),
+        sample_width=sample_width,
+        frame_rate=frame_rate,
+        channels=channels,
+    )
     logger_log("MERGE", f"合并完成，总时长 {len(merged_audio) / 1000:.1f}s")
     return merged_audio

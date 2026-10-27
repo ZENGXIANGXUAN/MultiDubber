@@ -15,6 +15,7 @@ init_logger(name="MultTTS")
 from typing import List, Optional, Dict, Union, Callable
 from tqdm import tqdm
 from pydub import AudioSegment
+import soundfile as sf
 import subprocess
 import concurrent.futures
 
@@ -405,11 +406,12 @@ def _check_task_skip_or_recover(subtitle_name, srt_file, output_folder_zh, outpu
                 pass
             return "process"
 
-        # 额外验证：确保 WAV 可被 pydub 读取
+        # 额外验证：确保 WAV 可被读取（只读文件头，避免整段解码占用大量内存）
         try:
-            test_audio = AudioSegment.from_file(output_audio_file)
-            if len(test_audio) < 100:  # < 0.1 秒，视为无效占位
-                log(f"  !! [恢复] WAV 时长异常 ({len(test_audio)}ms)，重新生成。")
+            info = sf.info(output_audio_file)
+            duration_ms = int(round(info.frames / info.samplerate * 1000)) if info.samplerate > 0 else 0
+            if duration_ms < 100:  # < 0.1 秒，视为无效占位
+                log(f"  !! [恢复] WAV 时长异常 ({duration_ms}ms)，重新生成。")
                 try:
                     os.remove(output_audio_file)
                 except OSError:
@@ -754,12 +756,22 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
             if on_all_down:
                 on_all_down()
 
+        def _on_pool_changed(snapshot):
+            # 运行中增删节点后，同步日志、状态接口与重启上下文。
+            log(f"[服务器池] {snapshot.get('state')} | 节点 {snapshot.get('server_count')} "
+                f"| 线程 {snapshot.get('threads')} | 队列 {snapshot.get('queue_size')}")
+            runtime_state.update_job_servers(
+                snapshot.get("server_configs", {}),
+                snapshot.get("server_protocols", {}),
+            )
+
         dispatcher = MultiServerDispatcher(
             server_configs=server_configs,
             server_protocols=server_protocols,
             max_retries=max_retries if max_retries is not None else config.MAX_RETRIES,
             on_server_down=_on_server_down,
             on_all_down=_on_all_down,
+            on_pool_changed=_on_pool_changed,
             circuit_breaker_threshold=circuit_breaker_threshold if circuit_breaker_threshold is not None else getattr(config, 'CIRCUIT_BREAKER_THRESHOLD', 6),
         )
         dispatcher.start()
@@ -1055,7 +1067,8 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                             params = task_params_map.get(idx)
                             if params is None:
                                 return
-                            proto = server_protocols.get(server_url, "voxcpm2") if server_protocols else "voxcpm2"
+                            # 运行中新增的节点不在启动快照里，协议必须实时向池查询。
+                            proto = dispatcher.get_protocol(server_url) if dispatcher else "voxcpm2"
                             # IndexTTS 1.5 服务端按 speed 变速生成；VoxCPM 2.0 无 speed 参数，实际为 1.0
                             effective_speed = params["speed"] if proto == "indextts_15" else 1.0
                             post_process_audio_task(
@@ -1354,6 +1367,9 @@ def restart_last_pipeline():
     ctx = runtime_state.get_last_job_context()
     if not ctx:
         raise RuntimeError("没有可重启的流程上下文")
+    # 运行中把节点删光后，上下文里的池可能为空；此时重启会退化成单服务器模式。
+    if "server_configs" in ctx and not ctx.get("server_configs"):
+        raise RuntimeError("服务器池为空，请先添加至少一台服务器再重启流程")
     process_srt_files(**ctx)
 
 

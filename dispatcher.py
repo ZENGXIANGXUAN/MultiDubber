@@ -48,6 +48,11 @@ SLOW_CPU_THRESHOLD_S  = 5.0    # CPU 后处理超过此时长打印 CPU_SLOW 警
 RECONNECT_IDLE_S      = 300.0  # 仅长时间空闲后预防性重连；普通批次复用现有连接
 MAX_NETWORK_ATTEMPTS_PER_TASK = 5     # 单个任务最多 5 次网络尝试，避免坏节点长期占用队列
 NETWORK_RETRY_BACKOFF_MAX_S = 15.0   # 网络重试退避等待上限
+TTS_READ_TIMEOUT_S    = 900.0  # 单次推理读超时；防止挂死节点永久占用 worker（正常单段 < 60s）
+CONNECT_SPACING_S     = 0.3    # 同一时刻只允许一个 worker 开始握手，避免 SSL 风暴
+
+# 运行时服务器池开关：关闭后 add/remove 不生效，行为回到“下次流程启动才更新”。
+LIVE_POOL_ENABLED = True
 
 # ──────────────────────────────────────────────
 # 服务器连接缓存 (线程独立存储，避免并发冲突)
@@ -72,12 +77,34 @@ def _get_client(url: str) -> Client:
             verbose=False,
             httpx_kwargs={"timeout": httpx.Timeout(15.0, connect=8.0)},
         )
-        client.httpx_kwargs["timeout"] = httpx.Timeout(None, connect=10.0)
+        client.httpx_kwargs["timeout"] = httpx.Timeout(TTS_READ_TIMEOUT_S, connect=10.0)
         _thread_local.client_cache[url] = client
         if DEBUG_DISPATCHER:
             _log("CONNECT", f"[{thread_name}] 连接建立成功: {url}")
 
     return _thread_local.client_cache[url]
+
+
+def _pop_client(url: str):
+    """从当前线程缓存中摘除指定连接（不负责关闭）。"""
+    cache = getattr(_thread_local, "client_cache", None)
+    if not cache:
+        return None
+    return cache.pop(url, None)
+
+
+def _close_client(client) -> None:
+    if client is None:
+        return
+    try:
+        client.close()
+    except Exception:
+        pass
+
+
+def _close_thread_clients(url: str) -> None:
+    """关闭当前线程对指定 URL 的连接，避免 worker 退出后连接池残留。"""
+    _close_client(_pop_client(url))
 
 
 def invalidate_client(url: str, error: bool = True):
@@ -88,8 +115,7 @@ def invalidate_client(url: str, error: bool = True):
         error: True 表示由 API 调用失败触发（计入熔断评估），
                False 表示空闲超时预防性重连（不计入）。
     """
-    if hasattr(_thread_local, "client_cache"):
-        _thread_local.client_cache.pop(url, None)
+    _close_client(_pop_client(url))
     if error:
         _mark_error_reconnect(url)
 
@@ -403,6 +429,8 @@ class _GpuTask:
 
     def __lt__(self, other):
         """PriorityQueue 排序：重试任务优先，同级内按入队时间升序"""
+        if not isinstance(other, _GpuTask):
+            return False  # 哨兵等非任务对象始终排在前面
         sk = (0 if self.is_requeued else 1, self.enqueue_time)
         ok = (0 if other.is_requeued else 1, other.enqueue_time)
         return sk < ok
@@ -424,9 +452,63 @@ class _CpuTask:
 class _Sentinel:
     """哨兵对象，始终排在 PriorityQueue 最前面，用于通知 Worker 退出。"""
     __slots__ = ()
-    def __lt__(self, other): return True
+    def __lt__(self, other):
+        return not isinstance(other, _Sentinel)
 
 _SENTINEL = _Sentinel()
+
+
+# ──────────────────────────────────────────────
+# URL / 线程数归一化 + 运行时活跃池句柄
+# ──────────────────────────────────────────────
+def normalize_url(url: str) -> str:
+    return str(url or "").strip()
+
+
+def sanitize_threads(value, allowed=(1, 2), default=1) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value in allowed else default
+
+
+_active_pool_lock = threading.Lock()
+_active_pool: Optional["MultiServerDispatcher"] = None
+
+
+def set_active_dispatcher(dispatcher) -> None:
+    global _active_pool
+    with _active_pool_lock:
+        _active_pool = dispatcher
+
+
+def clear_active_dispatcher(dispatcher=None) -> None:
+    global _active_pool
+    with _active_pool_lock:
+        if dispatcher is None or _active_pool is dispatcher:
+            _active_pool = None
+
+
+def get_active_dispatcher():
+    with _active_pool_lock:
+        return _active_pool
+
+
+def runtime_add_server(url, protocol=None, threads=None) -> bool:
+    """供 GUI/控制接口调用：把节点加入当前正在运行的池。未运行时返回 False。"""
+    if not LIVE_POOL_ENABLED:
+        return False
+    pool = get_active_dispatcher()
+    return bool(pool and pool.add_server(url, protocol, threads))
+
+
+def runtime_remove_server(url) -> bool:
+    """供 GUI/控制接口调用：从当前正在运行的池优雅摘除节点。"""
+    if not LIVE_POOL_ENABLED:
+        return False
+    pool = get_active_dispatcher()
+    return bool(pool and pool.remove_server(url))
 
 
 # ──────────────────────────────────────────────
@@ -440,23 +522,17 @@ class MultiServerDispatcher:
                  on_server_down: Optional[Callable] = None,
                  on_all_down: Optional[Callable] = None,
                  circuit_breaker_threshold: int = 3,
-                 server_protocols: Optional[Dict[str, str]] = None):
+                 server_protocols: Optional[Dict[str, str]] = None,
+                 on_pool_changed: Optional[Callable] = None):
         reset_circuit_breaker_states()  # 确保每轮新分发器启动时熔断状态干净
-        def _sanitize_threads(n) -> int:
-            try:
-                n = int(n)
-            except (TypeError, ValueError):
-                return 1
-            # gradio.live 批量任务只允许每台 1 或 2 线程，默认/异常回落 1。
-            return n if n in (1, 2) else 1
 
         self.server_configs = {
-            u.strip(): _sanitize_threads(n)
-            for u, n in server_configs.items() if u.strip()
+            normalize_url(u): sanitize_threads(n)
+            for u, n in server_configs.items() if normalize_url(u)
         }
         self.server_protocols = {
-            u.strip(): p.strip()
-            for u, p in (server_protocols or {}).items() if u.strip()
+            normalize_url(u): str(p).strip()
+            for u, p in (server_protocols or {}).items() if normalize_url(u)
         }
         self.max_retries = max(1, max_retries)
         global _circuit_breaker_threshold
@@ -464,24 +540,131 @@ class MultiServerDispatcher:
         _circuit_breaker_threshold = circuit_breaker_threshold if circuit_breaker_threshold < 0 else max(1, circuit_breaker_threshold)
         total_gpu_threads = sum(self.server_configs.values())
         self.cpu_workers = cpu_workers if cpu_workers > 0 else max(2, os.cpu_count() or 4)
-        self._on_server_down = on_server_down
-        self._on_all_down    = on_all_down
+        self._on_server_down  = on_server_down
+        self._on_all_down     = on_all_down
+        self._on_pool_changed = on_pool_changed
 
-        maxsize = max(total_gpu_threads * queue_depth_mul, 4)
+        self._queue_depth_mul = max(1, int(queue_depth_mul))
+        maxsize = max(total_gpu_threads * self._queue_depth_mul, 4)
         self._gpu_queue: queue.PriorityQueue = queue.PriorityQueue(maxsize=maxsize)
         self._cpu_queue: queue.Queue = queue.Queue()
 
-        self._gpu_worker_threads: List[threading.Thread] = []
+        # 每个 URL 一组 worker + 一个下线信号；支持运行中增删。
+        self._gpu_workers: Dict[str, List[threading.Thread]] = {}
+        self._worker_stop: Dict[str, threading.Event] = {}
         self._cpu_worker_threads: List[threading.Thread] = []
 
+        self._server_lock = threading.RLock()
+        self._spawn_lock  = threading.RLock()
         self._active_servers = set(self.server_configs.keys())
-        self._server_lock    = threading.Lock()
+        self._pool_state = "RUNNING" if self._active_servers else "PAUSED_NO_SERVERS"
+        self._pool_available = threading.Event()
+        if self._active_servers:
+            self._pool_available.set()
+        self._pause_logged = False
+        self._shutdown = False
+
+        # 握手闸门：线程立刻创建，握手按 CONNECT_SPACING_S 串行错峰，避免 SSL 风暴。
+        self._connect_gate = threading.Lock()
+        self._last_connect_at = 0.0
 
         self._total_submitted = 0
         self._total_done      = 0
         self._done_lock       = threading.Lock()
         self._all_done_event  = threading.Event()
         self._abort_event     = threading.Event()
+
+    # ── 池状态辅助 ──────────────────────────────
+    def _all_gpu_threads(self) -> List[threading.Thread]:
+        with self._spawn_lock:
+            groups = list(self._gpu_workers.values())
+        threads: List[threading.Thread] = []
+        for group in groups:
+            threads.extend(group)
+        return threads
+
+    def _has_active_servers(self) -> bool:
+        with self._server_lock:
+            return bool(self._active_servers)
+
+    def _pool_paused(self) -> bool:
+        with self._server_lock:
+            return self._pool_state == "PAUSED_NO_SERVERS" and not self._abort_event.is_set()
+
+    def _ensure_stop_event(self, url: str) -> threading.Event:
+        ev = self._worker_stop.get(url)
+        if ev is None:
+            ev = threading.Event()
+            self._worker_stop[url] = ev
+        return ev
+
+    def _connect_with_spacing(self, url: str):
+        """按固定间隔串行开始握手；实际连接在闸门外执行。"""
+        with self._connect_gate:
+            wait_s = CONNECT_SPACING_S - (time.time() - self._last_connect_at)
+            if wait_s > 0:
+                time.sleep(wait_s)
+            self._last_connect_at = time.time()
+        return _get_client(url)
+
+    def _resize_queue_capacity(self) -> None:
+        try:
+            with self._server_lock:
+                total = sum(int(n) for n in self.server_configs.values())
+            self._gpu_queue.maxsize = max(4, total * self._queue_depth_mul)
+        except Exception:
+            pass
+
+    def _notify_pool_changed(self) -> None:
+        callback = self._on_pool_changed
+        if callback is None:
+            return
+        try:
+            callback(self.pool_snapshot())
+        except Exception as e:
+            _log("POOL_WARN", f"服务器池变更回调异常: {e}")
+
+    def _log_pause_if_needed(self) -> None:
+        if self._pause_logged:
+            return
+        with self._server_lock:
+            paused = not self._active_servers
+        if paused:
+            self._pause_logged = True
+            _log("POOL_PAUSED",
+                 f"无可用服务器，{self._gpu_queue.qsize()} 个任务挂起；加入节点后自动继续。")
+
+    def _requeue_task(self, task: _GpuTask, reason: str = "") -> bool:
+        task.is_requeued = True
+        task.enqueue_time = time.time()
+        try:
+            self._gpu_queue.put(task, timeout=2.0)
+            return True
+        except Exception:
+            _log("WARN", f"Task {task.task_id} 重新入队失败"
+                         f"{(' (' + reason + ')') if reason else ''}，保持未完成状态。")
+            return False
+
+    def get_protocol(self, url: str) -> str:
+        with self._server_lock:
+            return self.server_protocols.get(url, "voxcpm2")
+
+    def pool_snapshot(self) -> dict:
+        workers = len(self._all_gpu_threads())
+        with self._server_lock:
+            active = sorted(self._active_servers)
+            state = self._pool_state
+            protocols = dict(self.server_protocols)
+            configs = dict(self.server_configs)
+        return {
+            "state": state,
+            "servers": active,
+            "server_count": len(active),
+            "threads": workers,
+            "queue_size": self._gpu_queue.qsize(),
+            "server_configs": configs,
+            "server_protocols": protocols,
+        }
 
     def start(self):
         # 不再在这里做第二轮“硬连通性探测”。
@@ -490,39 +673,158 @@ class MultiServerDispatcher:
         # 失败不会把节点永久踢出本轮任务，也不会因为逐台 Client(url) 阻塞整个启动流程。
         _log("INIT", "📡 启动 GPU Worker；节点连接失败将自动重试，并按熔断阈值处理。")
 
-        # ─── 错开启动 Worker，避免全部同时握手造成 SSL 风暴 ───
-        total = 0
-        for url, n in self.server_configs.items():
-            if url not in self._active_servers:
-                continue
-            proto = self.server_protocols.get(url, "voxcpm2")
-            for i in range(n):
+        set_active_dispatcher(self)
+
+        # 线程立即创建，握手由 worker 内部按 CONNECT_SPACING_S 串行错峰，
+        # 因此 start() 不再阻塞 0.3s×线程数。
+        with self._server_lock:
+            pending = [
+                (url, n, self.server_protocols.get(url, "voxcpm2"))
+                for url, n in self.server_configs.items()
+                if url in self._active_servers
+            ]
+
+        with self._spawn_lock:
+            for url, n, proto in pending:
+                self._ensure_stop_event(url)
+                self._spawn_server_workers(url, proto, n)
+
+            for i in range(self.cpu_workers):
                 t = threading.Thread(
-                    target=self._gpu_worker_loop,
-                    args=(url, proto),
-                    name=f"GPU-{url.rstrip('/').split(':')[-1]}-{i}",
+                    target=self._cpu_worker_loop,
+                    name=f"CPU-{i}",
                     daemon=True
                 )
                 t.start()
-                self._gpu_worker_threads.append(t)
-                total += 1
-                time.sleep(0.3)  # 每个 worker 间隔 300ms 启动，错开 SSL 握手
+                self._cpu_worker_threads.append(t)
 
-        for i in range(self.cpu_workers):
-            t = threading.Thread(
-                target=self._cpu_worker_loop,
-                name=f"CPU-{i}",
-                daemon=True
+        total = len(self._all_gpu_threads())
+        with self._server_lock:
+            cfg = ", ".join(
+                f"{u.rstrip('/').split(':')[-1]}[{self.server_protocols.get(u, 'voxcpm2')}]×{n}"
+                for u, n in self.server_configs.items()
             )
-            t.start()
-            self._cpu_worker_threads.append(t)
-
-        cfg = ", ".join(f"{u.rstrip('/').split(':')[-1]}[{self.server_protocols.get(u, 'voxcpm2')}]×{n}"
-                        for u, n in self.server_configs.items())
         _log("INIT", f"启动完成: GPU集群({cfg}) 共{total}线程 | "
                      f"CPU {self.cpu_workers}线程 | 队列容量 {self._gpu_queue.maxsize} | "
                      f"任务最大重试 {self.max_retries} 次 | "
                      f"熔断阈值 {'已禁用' if _circuit_breaker_threshold < 0 else f'{_circuit_breaker_threshold} 次连续重连失败'}")
+        self._notify_pool_changed()
+
+    # ── 运行时增删节点 ──────────────────────────
+    def _spawn_server_workers(self, url: str, protocol: str, count: int) -> None:
+        """创建指定数量的 worker（不阻塞、不做握手）。调用方需持有 _spawn_lock。"""
+        with self._server_lock:
+            if url not in self._active_servers:
+                return
+        stop_event = self._ensure_stop_event(url)
+        tag = url.rstrip('/').split(':')[-1]
+        for i in range(count):
+            if self._shutdown or stop_event.is_set():
+                break
+            t = threading.Thread(
+                target=self._gpu_worker_loop,
+                args=(url, protocol, stop_event),
+                name=f"GPU-{tag}-{i}",
+                daemon=True,
+            )
+            t.start()
+            self._gpu_workers.setdefault(url, []).append(t)
+
+    def add_server(self, url, protocol=None, threads=None) -> bool:
+        """把节点加入运行中的池；已存在或池已关闭时返回 False。"""
+        url = normalize_url(url)
+        if not url:
+            return False
+
+        if not LIVE_POOL_ENABLED:
+            return False
+
+        with self._spawn_lock:
+            if self._shutdown:
+                return False
+
+            proto = str(protocol or self.server_protocols.get(url) or "voxcpm2").strip()
+            n = sanitize_threads(
+                threads if threads is not None else self.server_configs.get(url, 1)
+            )
+
+            with self._server_lock:
+                if url in self._active_servers:
+                    return False
+                self.server_configs[url] = n
+                self.server_protocols[url] = proto
+                self._active_servers.add(url)
+                self._pool_state = "RUNNING"
+                self._pool_available.set()
+                self._pause_logged = False
+
+            # 重加同一 URL 必须清掉旧熔断计数，否则刚上线就可能被判死。
+            with _cb_lock:
+                _server_states.pop(url, None)
+
+            self._ensure_stop_event(url)
+            self._resize_queue_capacity()
+            self._spawn_server_workers(url, proto, n)
+
+        with self._server_lock:
+            server_count = len(self.server_configs)
+            thread_count = sum(self.server_configs.values())
+        _log("POOL_ADD", f"{url} [{proto}]×{n} 已加入运行中的服务器池 "
+                         f"（当前 {server_count} 台 / {thread_count} 线程）")
+        self._notify_pool_changed()
+        return True
+
+    def remove_server(self, url) -> bool:
+        """从运行中的池优雅摘除节点：不再派新任务，在途任务完成后退出。"""
+        url = normalize_url(url)
+        if not url:
+            return False
+
+        with self._spawn_lock:
+            with self._server_lock:
+                if url not in self._active_servers:
+                    return False
+                self._active_servers.discard(url)
+                self.server_configs.pop(url, None)
+                if not self._active_servers:
+                    self._pool_state = "PAUSED_NO_SERVERS"
+                    self._pool_available.clear()
+
+            stop_event = self._worker_stop.get(url)
+            if stop_event is not None:
+                stop_event.set()
+            threads = self._gpu_workers.pop(url, [])
+            self._resize_queue_capacity()
+
+        if threads:
+            threading.Thread(
+                target=self._join_workers,
+                args=(url, threads, stop_event),
+                name=f"POOL-DRAIN-{url.rstrip('/').split(':')[-1]}",
+                daemon=True,
+            ).start()
+
+        _log("POOL_REMOVE", f"{url} 已从服务器池摘除：不再派新任务，在途任务完成后退出。")
+        self._notify_pool_changed()
+        return True
+
+    def _join_workers(self, url: str, threads: List[threading.Thread], stop_event=None,
+                      timeout: float = 600.0) -> None:
+        deadline = time.time() + timeout
+        for t in threads:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            if t.is_alive():
+                t.join(remaining)
+        alive = [t for t in threads if t.is_alive()]
+        with self._spawn_lock:
+            if stop_event is not None and self._worker_stop.get(url) is stop_event:
+                self._worker_stop.pop(url, None)
+        if alive:
+            _log("POOL_WARN", f"{url} 仍有 {len(alive)} 个 worker 未退出（在途任务可能仍在运行）。")
+        else:
+            _log("POOL_REMOVED", f"{url} 的 worker 已全部退出。")
 
     def run_feeder(self,
                    task_iter: Iterable[Tuple],
@@ -533,53 +835,82 @@ class MultiServerDispatcher:
             self._total_done = 0          # 重置已完成计数
             self._all_done_event.clear()  # 清除上一个文件的完成事件信号
             self._total_submitted = float('inf')
+            self._pause_logged = False
+
+        def _abort_requested() -> bool:
+            return abort_flag_fn() or self._abort_event.is_set() or self._shutdown
 
         submitted = 0
         for task_id, ref_audio_path, gen_text, speed in task_iter:
-            if abort_flag_fn() or self._abort_event.is_set():
+            if _abort_requested():
                 break
 
             task = _GpuTask(task_id, ref_audio_path, gen_text, speed,
                             post_process_fn, done_callback)
 
             # 避免阻塞式 put 导致在 abort/熔断时死锁
-            while not (abort_flag_fn() or self._abort_event.is_set()):
+            while not _abort_requested():
                 try:
                     self._gpu_queue.put(task, timeout=0.5)
                     submitted += 1
                     break
                 except queue.Full:
+                    self._log_pause_if_needed()
                     continue
 
         with self._done_lock:
             self._total_submitted = submitted
-            if submitted == 0 or self._total_done >= submitted or self._abort_event.is_set() or abort_flag_fn():
+            if submitted == 0 or self._total_done >= submitted or _abort_requested():
                 self._all_done_event.set()
                 return
 
-        while not (self._all_done_event.wait(timeout=0.5) or self._abort_event.is_set() or abort_flag_fn()):
-            # 防御性检查：若所有 GPU worker 线程均已退出，自动触发终止避免死锁
-            if self._gpu_worker_threads and all(not t.is_alive() for t in self._gpu_worker_threads):
+        while not _abort_requested():
+            if self._all_done_event.wait(timeout=0.5):
+                return
+
+            # 池被用户清空：挂起等待，不当作故障终止，也不丢队列里的任务。
+            if not self._has_active_servers():
+                self._log_pause_if_needed()
+                self._pool_available.wait(0.5)
+                continue
+
+            # 防御性检查：仍有 active 节点，但所有 GPU worker 线程均已退出 → 异常终止
+            threads = self._all_gpu_threads()
+            if threads and all(not t.is_alive() for t in threads):
                 _log("DISPATCHER_WARN", "所有 GPU Worker 线程均已退出，结束当前批次等待。")
                 self._abort_event.set()
                 self._all_done_event.set()
-                break
+                return
 
     def join(self):
         self._all_done_event.wait()
 
     def stop(self):
+        self._shutdown = True
         self._abort_event.set()
         self._all_done_event.set()
+        self._pool_available.set()
 
-        for t in self._gpu_worker_threads:
+        with self._spawn_lock:
+            for ev in self._worker_stop.values():
+                ev.set()
+            gpu_threads = self._all_gpu_threads()
+            cpu_threads = list(self._cpu_worker_threads)
+
+        for _ in gpu_threads:
+            try:
+                self._gpu_queue.put_nowait(_SENTINEL)
+            except queue.Full:
+                pass
+
+        # 全局截止时间，避免逐线程 3s 串行等待导致退出被拖到几十秒。
+        deadline = time.time() + 5.0
+        for t in gpu_threads:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
             if t.is_alive():
-                try:
-                    self._gpu_queue.put_nowait(_SENTINEL)
-                except queue.Full:
-                    pass
-        for t in self._gpu_worker_threads:
-            t.join(timeout=3)
+                t.join(remaining)
 
         abandoned = 0
         try:
@@ -593,14 +924,18 @@ class MultiServerDispatcher:
         if abandoned:
             _log("STOP", f"调度器已停止，队列中 {abandoned} 个未完成任务已安全释放（保持未完成状态，供下次断点恢复）。")
 
-        for t in self._cpu_worker_threads:
+        for _ in cpu_threads:
+            try:
+                self._cpu_queue.put_nowait(_SENTINEL)
+            except queue.Full:
+                pass
+        cpu_deadline = time.time() + 3.0
+        for t in cpu_threads:
+            remaining = cpu_deadline - time.time()
+            if remaining <= 0:
+                break
             if t.is_alive():
-                try:
-                    self._cpu_queue.put_nowait(_SENTINEL)
-                except queue.Full:
-                    pass
-        for t in self._cpu_worker_threads:
-            t.join(timeout=3)
+                t.join(remaining)
 
         try:
             while True:
@@ -614,33 +949,76 @@ class MultiServerDispatcher:
         except queue.Empty:
             pass
 
+        with self._server_lock:
+            if self._pool_state != "ABORTED":
+                self._pool_state = "STOPPED"
+        with self._spawn_lock:
+            self._gpu_workers.clear()
+            self._worker_stop.clear()
+        clear_active_dispatcher(self)
+
     @property
     def all_servers_down(self) -> bool:
         return self._abort_event.is_set()
 
     def _mark_server_down(self, url: str, reason: str):
+        all_down = False
+        stop_event = None
+        threads: List[threading.Thread] = []
         with self._server_lock:
-            if url not in self._active_servers: return
+            if url not in self._active_servers:
+                return
             self._active_servers.discard(url)
-            _log("SERVER_DOWN", f"!! 服务器下线: {url} | {reason}")
-            if self._on_server_down:
-                try: self._on_server_down(url, reason)
+            self.server_configs.pop(url, None)  # 不再参与容量/启动日志；协议保留给在途后处理
+            stop_event = self._worker_stop.get(url)
+            if stop_event is not None:
+                stop_event.set()
+            if not self._active_servers:
+                self._pool_available.clear()
+                if self._pool_state != "PAUSED_NO_SERVERS":
+                    self._pool_state = "ABORTED"
+                    all_down = True
+
+        with self._spawn_lock:
+            threads = self._gpu_workers.pop(url, [])
+            self._resize_queue_capacity()
+
+        _log("SERVER_DOWN", f"!! 服务器下线: {url} | {reason}")
+        if self._on_server_down:
+            try: self._on_server_down(url, reason)
+            except Exception: pass
+
+        if threads:
+            threading.Thread(
+                target=self._join_workers,
+                args=(url, threads, stop_event),
+                name=f"POOL-DRAIN-{url.rstrip('/').split(':')[-1]}",
+                daemon=True,
+            ).start()
+
+        if all_down:
+            _log("ALL_DOWN", "!! 所有服务器均已下线，停止程序！")
+            self._abort_event.set()
+            self._all_done_event.set()
+            if self._on_all_down:
+                try: self._on_all_down()
                 except Exception: pass
 
-            if not self._active_servers:
-                _log("ALL_DOWN", "!! 所有服务器均已下线，停止程序！")
-                self._abort_event.set()
-                self._all_done_event.set()
-                if self._on_all_down:
-                    try: self._on_all_down()
-                    except Exception: pass
+        self._notify_pool_changed()
 
-    def _gpu_worker_loop(self, url: str, protocol: str = "voxcpm2"):
+    def _gpu_worker_loop(self, url: str, protocol: str, stop_event: threading.Event):
+        try:
+            self._gpu_worker_body(url, protocol, stop_event)
+        finally:
+            _close_thread_clients(url)
+
+    def _gpu_worker_body(self, url: str, protocol: str, stop_event: threading.Event):
         worker_name = threading.current_thread().name
 
-        # ✨ Worker 线程启动时立即建立本线程的独立连接，避免首批任务集体等待建连
+        # ✨ Worker 线程启动时立即建立本线程的独立连接，避免首批任务集体等待建连。
+        # 握手按全局闸门错峰，start()/add_server() 不再被 sleep 阻塞。
         try:
-            _get_client(url)
+            self._connect_with_spacing(url)
             if DEBUG_DISPATCHER:
                 _log("WORKER_READY", f"{worker_name} 连接预热完成: {url} [{protocol}]")
         except Exception as e:
@@ -657,11 +1035,14 @@ class MultiServerDispatcher:
 
         last_success_time = time.time()
         local_retry_task = None
+        idle_since = None
 
         while True:
+            if self._abort_event.is_set() or self._shutdown or stop_event.is_set():
+                break
             with self._server_lock:
                 is_down = url not in self._active_servers
-            if is_down or self._abort_event.is_set():
+            if is_down:
                 break
 
             task_from_queue = local_retry_task is None
@@ -670,14 +1051,30 @@ class MultiServerDispatcher:
                 local_retry_task = None
             else:
                 try:
-                    task = self._gpu_queue.get(timeout=IDLE_WARN_THRESHOLD_S)
+                    # 0.5s 轮询：让“运行中摘除节点”最多半秒内被感知
+                    task = self._gpu_queue.get(timeout=0.5)
                 except queue.Empty:
-                    if DEBUG_DISPATCHER:
-                        _log("WORKER_IDLE", f"{worker_name} idle >{IDLE_WARN_THRESHOLD_S}s")
+                    now = time.time()
+                    if idle_since is None:
+                        idle_since = now
+                    elif now - idle_since >= IDLE_WARN_THRESHOLD_S:
+                        if DEBUG_DISPATCHER:
+                            _log("WORKER_IDLE", f"{worker_name} idle >{IDLE_WARN_THRESHOLD_S}s")
+                        idle_since = now
                     continue
+                idle_since = None
 
             if task is _SENTINEL:
                 self._gpu_queue.task_done()
+                break
+
+            # 节点可能在上面的 get() 阻塞期间被摘除：把刚取到的任务放回队列，不再处理。
+            if stop_event.is_set() or self._abort_event.is_set() or self._shutdown:
+                if task_from_queue:
+                    self._gpu_queue.task_done()
+                if not (self._abort_event.is_set() or self._shutdown):
+                    self._requeue_task(task, "节点已摘除")
+                local_retry_task = None
                 break
 
             if DEBUG_DISPATCHER:
@@ -737,25 +1134,21 @@ class MultiServerDispatcher:
                         _log("CIRCUIT_BREAK", f"!! {url} | {reason}")
                         self._mark_server_down(url, reason)
 
-                        with self._server_lock:
-                            has_active = bool(self._active_servers)
-
-                        if not has_active or self._abort_event.is_set():
-                            # 所有服务器均已下线或已终止：保留未完成状态，严禁转静音占位！
+                        if self._abort_event.is_set():
+                            # 已终止/全部熔断：保留未完成状态，严禁转静音占位！
                             _log("CIRCUIT_DROP", f"无可用活跃服务器，Task {task.task_id} 保持未完成状态（供下次恢复）。")
+                        elif not self._has_active_servers():
+                            if self._pool_paused():
+                                _log("POOL_HOLD",
+                                     f"Task {task.task_id} 在节点 {url} 失败；池已暂停，任务留在队列等待新节点。")
+                                task.network_retry_count = 0
+                                self._requeue_task(task, "池已暂停")
+                            else:
+                                _log("CIRCUIT_DROP", f"无可用活跃服务器，Task {task.task_id} 保持未完成状态（供下次恢复）。")
                         else:
-                            task.is_requeued = True
-                            task.network_retry_count = 0  # 重置网络尝试计数，交给其他可用节点接替
-                            task.enqueue_time = time.time()
                             _log("RETRY_CIRCUIT", f"Task {task.task_id} 因节点 {url} 熔断重新入队，由其他可用节点接替处理。")
-                            try:
-                                self._gpu_queue.put(task, timeout=2.0)
-                            except Exception:
-                                time.sleep(0.5)
-                                try:
-                                    self._gpu_queue.put(task, timeout=2.0)
-                                except Exception:
-                                    _log("WARN", f"Task {task.task_id} 重新入队超时，保持未完成状态。")
+                            task.network_retry_count = 0  # 重置网络尝试计数，交给其他可用节点接替
+                            self._requeue_task(task, "节点熔断")
                         if task_from_queue:
                             self._gpu_queue.task_done()
                         break
@@ -784,6 +1177,13 @@ class MultiServerDispatcher:
                                     self._gpu_queue.put(task, timeout=2.0)
                                 except Exception:
                                     _log("WARN", f"Task {task.task_id} 跨节点重新入队超时，保持未完成状态。")
+                            elif self._pool_paused():
+                                _log(
+                                    "NET_HOLD_PAUSED",
+                                    f"Task {task.task_id} 网络重试达到上限；池已暂停，任务留在队列等待新节点。"
+                                )
+                                task.network_retry_count = 0
+                                self._requeue_task(task, "池已暂停")
                             else:
                                 _log(
                                     "NET_HOLD",
@@ -804,6 +1204,11 @@ class MultiServerDispatcher:
 
                         # PriorityQueue 没有延迟队列，这里由当前 worker 小睡后再放回，降低 SSL 重连风暴。
                         time.sleep(backoff_s)
+                        if stop_event.is_set() or self._abort_event.is_set() or self._shutdown:
+                            self._requeue_task(task, "节点已摘除")
+                            if task_from_queue:
+                                self._gpu_queue.task_done()
+                            break
                         try:
                             self._gpu_queue.put_nowait(task)
                         except queue.Full:
@@ -849,11 +1254,12 @@ class MultiServerDispatcher:
 
         # 退出循环后兜底回收未处理的 local_retry_task
         if local_retry_task is not None:
-            with self._server_lock:
-                has_active = bool(self._active_servers)
-            if not has_active or self._abort_event.is_set():
+            if self._abort_event.is_set() or self._shutdown:
                 _log("WORKER_EXIT", f"节点退出，Task {local_retry_task.task_id} 保持未完成状态。")
             else:
+                # 池暂停时也放回队列：节点重新加入后可以直接续跑
+                local_retry_task.is_requeued = True
+                local_retry_task.enqueue_time = time.time()
                 try:
                     self._gpu_queue.put(local_retry_task, timeout=1.0)
                 except Exception:
