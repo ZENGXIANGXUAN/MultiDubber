@@ -284,12 +284,14 @@ def adjust_duration_with_rubberband(input_path: str, output_path: str, target_du
         if not USE_TQDM_PROGRESS_BAR:
             _safe_print(f"    -> 需调节时长：从 {current_duration_s:.2f}s 到 {target_duration_s:.2f}s (原始速率: {rate:.2f}x)")
         if rate < MIN_RUBBERBAND_RATE:
-            logger_log(
-                "AUDIO",
-                f"    -> 速率 {rate:.2f}x 低于下限 {MIN_RUBBERBAND_RATE}x，"
-                f"以 {MIN_RUBBERBAND_RATE}x 拉伸后补静音"
-                f"（{current_duration_s:.2f}s / 目标 {target_duration_s:.2f}s）",
-            )
+            # 这是正常路径（预测时长明显短于字幕时间槽），不进日志：
+            # 每段都打会把 GUI 日志刷满。真正值得关注的“补了多久静音”
+            # 由 merge_audio 的短片段告警统一汇总。
+            if not USE_TQDM_PROGRESS_BAR:
+                _safe_print(
+                    f"    -> 速率 {rate:.2f}x 低于下限 {MIN_RUBBERBAND_RATE}x，"
+                    f"拉伸到 {MIN_RUBBERBAND_RATE}x 后补静音"
+                )
 
             # rb.time_stretch 在后台调用 rubberband.exe
             stretched_y = rb.time_stretch(y, sr, MIN_RUBBERBAND_RATE)
