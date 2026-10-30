@@ -620,6 +620,7 @@ class TTSApp(QWidget):
         self._check_threads: list = []
         self._server_down_webhook_generation = 0
         self._all_down_webhook_sent = False
+        self._processing = False  # 任务运行中：锁定 START 按钮，防止动态增删服务器把它重新点亮
 
         # 加载本地设置
         self._settings = load_settings()
@@ -988,6 +989,12 @@ class TTSApp(QWidget):
         }
 
     def _update_run_btn(self):
+        if self._processing:
+            # 任务运行中：保持 PROCESSING... 禁用态。
+            # 添加/移除服务器、文件夹都会调用本方法，不能因此把按钮重新点亮。
+            self.run_btn.setEnabled(False)
+            self.run_btn.setToolTip("Task is running. Please wait for it to finish.")
+            return
         if self._get_server_configs() and self._folder_widgets:
             self.run_btn.setEnabled(True)
             self.run_btn.setToolTip("")
@@ -1203,6 +1210,10 @@ class TTSApp(QWidget):
         self._update_run_btn()
 
     def start_processing(self):
+        if self._processing:
+            # 防御性重入保护：任务运行中不允许再起一条流水线
+            self.append_log("> 任务已在运行中，忽略重复启动。")
+            return
         line_idx = self._settings.get("line_index", 2)
         config.MERGE_MAX_CHARS = self._settings.get("merge_max_chars", 30)
         server_configs = self._get_server_configs()
@@ -1225,6 +1236,7 @@ class TTSApp(QWidget):
         self._server_down_webhook_generation += 1
         self._all_down_webhook_sent = False
 
+        self._processing = True
         self.run_btn.setEnabled(False)
         self.run_btn.setText("PROCESSING...")
         self.add_folder_btn.setEnabled(False)
@@ -1285,8 +1297,9 @@ class TTSApp(QWidget):
         self.lbl_task_progress.setText(f"Current File Tasks: {current}/{total}")
 
     def process_finished(self, completed: bool):
-        self.run_btn.setEnabled(True)
+        self._processing = False
         self.run_btn.setText("START DUBBING")
+        self._update_run_btn()
         self.add_folder_btn.setEnabled(True)
         self.add_btn.setEnabled(True)
         self.settings_btn.setEnabled(True)

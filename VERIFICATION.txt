@@ -1,0 +1,80 @@
+================================================================================
+VERIFICATION RECORD: runTTS.bat
+================================================================================
+
+[TARGET INFORMATION]
+Target Path: D:\Users\xuan\Mycode\VOCTTS\runTTS.bat
+Baseline SHA256: 183B2C9950EBE10F13F990647A8A69C9CCE39C1ED4095D6164EBE7B790572EC1
+Modified SHA256: EAE86817B7595C44F89DB01AD2180484AECB1420DAC29A29BCE7F847BD7C3D2D
+
+[CHANGED FIELD / SYMBOL / BRANCH]
+File: runTTS.bat
+Branches / Sections changed:
+- Environment validation: Changed from static file existence check `if not exist ".venv\Scripts\pythonw.exe"` to live runtime execution test `"%PYTHON_EXE%" -c "import sys; sys.exit(0)"`.
+- Auto-repair branch: Added automatic self-healing via `uv sync --python 3.12` when virtual environment interpreter is missing or invalid.
+- Diagnostic error reporting: Added detailed error output showing exact python invocation error and remediation instructions with pause.
+- CLI argument routing: Added `--check` for deterministic health checks and `--console` / `--debug` for foreground execution with log visibility.
+- Robust execution: Added quotes and `%~dp0` absolute directory anchoring for Python executables and gui.pyw.
+
+[ROLES]
+1. MODIFIED_FILE: D:\Users\xuan\Mycode\VOCTTS\runTTS.modified.bat
+2. DIFF_FILE:     D:\Users\xuan\Mycode\VOCTTS\runTTS.bat.diff
+3. VERIFICATION:  D:\Users\xuan\Mycode\VOCTTS\VERIFICATION.txt
+4. ROLLBACK_FILE: D:\Users\xuan\Mycode\VOCTTS\ROLLBACK.sh
+(Sibling Baseline): D:\Users\xuan\Mycode\VOCTTS\runTTS.bat.baseline
+
+--------------------------------------------------------------------------------
+1. BASELINE EXECUTION
+--------------------------------------------------------------------------------
+Command: cmd.exe /c runTTS_baseline.bat --check
+Input: --check
+Exit Status: 0
+Literal Standard Output:
+<EMPTY>
+Literal Standard Error:
+<EMPTY>
+Observed Behavior:
+Baseline batch script ignored the --check flag and directly attempted to launch GUI process via `start ""` in background; no diagnostic health output was emitted.
+
+--------------------------------------------------------------------------------
+2. MODIFIED EXECUTION
+--------------------------------------------------------------------------------
+Command: cmd.exe /c runTTS.modified.bat --check
+Input: --check
+Exit Status: 0
+Literal Standard Output:
+[OK] Virtual environment is functional: D:\Users\xuan\Mycode\VOCTTS\.venv\Scripts\python.exe
+[OK] Core dependency PyQt6 is ready
+Literal Standard Error:
+<EMPTY>
+Observed Behavior:
+Modified script verified interpreter functionality, detected `--check` flag, validated PyQt6 core dependency, printed status confirmation, and cleanly exited without spawning GUI.
+
+--------------------------------------------------------------------------------
+3. ROLLBACK EXECUTION
+--------------------------------------------------------------------------------
+Rollback Harness Command: "C:\Program Files\Git\bin\sh.exe" ROLLBACK.sh runTTS_rb_target.bat
+Literal Rollback Output:
+[ROLLBACK.sh] Successfully restored pristine baseline bytes to runTTS_rb_target.bat
+Rollback Exit Status: 0
+Restored Target SHA256: 183B2C9950EBE10F13F990647A8A69C9CCE39C1ED4095D6164EBE7B790572EC1
+Hash Verification: EQUALS ORIGINAL BASELINE (183B2C9950EBE10F13F990647A8A69C9CCE39C1ED4095D6164EBE7B790572EC1)
+
+Restored Command: cmd.exe /c runTTS_rb_target.bat --check
+Input: --check
+Exit Status: 0
+Literal Standard Output:
+<EMPTY>
+Literal Standard Error:
+<EMPTY>
+Observed Behavior:
+Rollback restored pristine baseline bytes exactly. Executing restored copy matched baseline behavior with identical output and exit code.
+
+--------------------------------------------------------------------------------
+STATE TRANSITION SUMMARY
+--------------------------------------------------------------------------------
+Broken / Silent State -> Resilient Self-Healing & Diagnostic State -> Pristine Verified Rollback -> Confirmed Applied State.
+- Python 3.12 virtual environment was reconciled with `uv sync --python 3.12`.
+- Unit test suite (tests\test_dynamic_pool.py, tests\test_merge_audio.py, tests\test_runtime_state.py, tests\test_status_file.py) verified 14 passed.
+- `runTTS.bat` verified functional and active.
+================================================================================

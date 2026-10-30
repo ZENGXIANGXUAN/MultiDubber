@@ -1,12 +1,74 @@
 @echo off
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-if not exist ".venv\Scripts\pythonw.exe" (
-    echo ERROR: .venv\Scripts\pythonw.exe was not found.
-    echo Please create or repair the project virtual environment first.
+set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
+set "PYTHONW_EXE=%~dp0.venv\Scripts\pythonw.exe"
+set "GUI_SCRIPT=%~dp0gui.pyw"
+
+REM 1. Check if virtual environment python works
+set "VENV_OK=0"
+if exist "%PYTHON_EXE%" (
+    "%PYTHON_EXE%" -c "import sys; sys.exit(0)" >nul 2>&1
+    if !ERRORLEVEL! equ 0 (
+        set "VENV_OK=1"
+    )
+)
+
+REM 2. If venv is broken or missing, try auto-repair via uv
+if "!VENV_OK!"=="0" (
+    where uv >nul 2>&1
+    if !ERRORLEVEL! equ 0 (
+        echo [.venv] Virtual environment missing or invalid, repairing with uv...
+        uv sync --python 3.12
+        if !ERRORLEVEL! equ 0 (
+            if exist "%PYTHON_EXE%" (
+                "%PYTHON_EXE%" -c "import sys; sys.exit(0)" >nul 2>&1
+                if !ERRORLEVEL! equ 0 (
+                    set "VENV_OK=1"
+                )
+            )
+        )
+    )
+)
+
+REM 3. If still not working, report error and pause
+if "!VENV_OK!"=="0" (
+    echo [ERROR] Failed to start Python virtual environment.
+    if exist "%PYTHON_EXE%" (
+        echo Executing %PYTHON_EXE% to capture error:
+        "%PYTHON_EXE%" -c "import sys; sys.exit(0)"
+    ) else (
+        echo Interpreter not found: %PYTHON_EXE%
+    )
+    echo Please make sure uv or Python 3.12 is installed, then run: uv sync --python 3.12
     pause
     exit /b 1
 )
 
-start "" ".venv\Scripts\pythonw.exe" "%~dp0gui.pyw"
+REM 4. Handle flag --check
+if "%~1"=="--check" (
+    echo [OK] Virtual environment is functional: %PYTHON_EXE%
+    "%PYTHON_EXE%" -c "import PyQt6; print('[OK] Core dependency PyQt6 is ready')"
+    exit /b 0
+)
+
+REM 5. Handle flag --console or --debug
+if "%~1"=="--console" (
+    "%PYTHON_EXE%" "%GUI_SCRIPT%"
+    if !ERRORLEVEL! neq 0 pause
+    exit /b !ERRORLEVEL!
+)
+if "%~1"=="--debug" (
+    "%PYTHON_EXE%" "%GUI_SCRIPT%"
+    if !ERRORLEVEL! neq 0 pause
+    exit /b !ERRORLEVEL!
+)
+
+REM 6. Launch GUI in background
+if exist "%PYTHONW_EXE%" (
+    start "" "%PYTHONW_EXE%" "%GUI_SCRIPT%"
+) else (
+    start "" "%PYTHON_EXE%" "%GUI_SCRIPT%"
+)
 exit /b 0
