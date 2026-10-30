@@ -84,11 +84,14 @@ DEFAULT_SETTINGS = {
     "servers": [],
     "server_protocols": {},  # url -> "indextts_15" / "voxcpm2"
     "server_threads_per_server": 1,  # 每台服务器并发线程数
-    "merge_max_chars": 30,  # 字幕合并字数上限，0=禁用
     "background_merge": False,  # 后台合并音视频
 }
 
-_REMOVED_SETTINGS_KEYS = ("api_public_key", "api_private_key", "api_hostid")
+# 已移除的配置项：读取时清掉，保存时过滤，避免旧 app_settings.json 里继续残留。
+_REMOVED_SETTINGS_KEYS = (
+    "api_public_key", "api_private_key", "api_hostid",
+    "merge_max_chars",  # 字幕合并已取消，一条字幕 = 一次请求
+)
 
 
 def load_settings() -> dict:
@@ -198,7 +201,6 @@ class SettingsDialog(QDialog):
                  circuit_breaker_threshold: int = 6,
                  wxpusher_app_token: str = "",
                  wxpusher_uid: str = "",
-                 merge_max_chars: int = 30,
                  background_merge: bool = False,
                  server_threads_per_server: int = 1):
         super().__init__(parent)
@@ -232,18 +234,6 @@ class SettingsDialog(QDialog):
             "支持 IndexTTS 1.5 与 VoxCPM 2.0 节点自动负载均衡。"
         )
         form.addRow("每服务器并发数:", self.spin_server_threads)
-
-        # Merge Max Chars
-        self.spin_merge_chars = QSpinBox()
-        self.spin_merge_chars.setRange(0, 200)
-        self.spin_merge_chars.setValue(merge_max_chars)
-        self.spin_merge_chars.setMinimumHeight(32)
-        self.spin_merge_chars.setToolTip(
-            "合并后文本的最大字符数。\n"
-            "连续字幕在不超此限制时会合并为一条，减少 API 调用。\n"
-            "设为 0 禁用合并功能。"
-        )
-        form.addRow("合并字数上限:", self.spin_merge_chars)
 
         # Background Merge
         self.chk_background_merge = QCheckBox("后台合并音视频")
@@ -397,10 +387,6 @@ class SettingsDialog(QDialog):
     @property
     def wxpusher_uid(self) -> str:
         return self.wx_uid_input.text().strip()
-
-    @property
-    def merge_max_chars(self) -> int:
-        return self.spin_merge_chars.value()
 
     @property
     def background_merge(self) -> bool:
@@ -752,7 +738,6 @@ class TTSApp(QWidget):
         self.lbl_retry_summary = QLabel(f"最大重试: {self._settings.get('max_retries', 5)}")
         _cb_val = self._settings.get('circuit_breaker_threshold', 6)
         self.lbl_cb_summary = QLabel(f"熔断阈值: {'已禁用' if _cb_val < 0 else _cb_val}")
-        self.lbl_merge_summary = QLabel(f"合并字数: {self._settings.get('merge_max_chars', 30)}")
         self.lbl_threads_summary = QLabel(f"每服务器并发: {self._settings.get('server_threads_per_server', 1)}")
         self.lbl_bg_merge_summary = QLabel()
         self.lbl_webhook_summary = QLabel()
@@ -760,7 +745,7 @@ class TTSApp(QWidget):
 
         for lbl in (self.lbl_line_summary, self.lbl_retry_summary,
                     self.lbl_cb_summary,
-                    self.lbl_merge_summary, self.lbl_threads_summary,
+                    self.lbl_threads_summary,
                     self.lbl_bg_merge_summary,
                     self.lbl_webhook_summary):
             lbl.setStyleSheet("color: #aaa; font-size: 12px;")
@@ -778,8 +763,6 @@ class TTSApp(QWidget):
         summary_layout.addWidget(self.lbl_retry_summary)
         summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_cb_summary)
-        summary_layout.addSpacing(20)
-        summary_layout.addWidget(self.lbl_merge_summary)
         summary_layout.addSpacing(20)
         summary_layout.addWidget(self.lbl_threads_summary)
         summary_layout.addSpacing(20)
@@ -894,7 +877,6 @@ class TTSApp(QWidget):
             circuit_breaker_threshold=self._settings.get("circuit_breaker_threshold", 6),
             wxpusher_app_token=self._settings.get("wxpusher_app_token", ""),
             wxpusher_uid=self._settings.get("wxpusher_uid", ""),
-            merge_max_chars=self._settings.get("merge_max_chars", 30),
             background_merge=self._settings.get("background_merge", False),
             server_threads_per_server=self._settings.get("server_threads_per_server", 1),
         )
@@ -907,12 +889,10 @@ class TTSApp(QWidget):
             self._settings["wxpusher_app_token"] = dlg.wxpusher_app_token
             self._settings["wxpusher_uid"] = dlg.wxpusher_uid
 
-            self._settings["merge_max_chars"] = dlg.merge_max_chars
             self._settings["background_merge"] = dlg.background_merge
             self._settings["server_threads_per_server"] = dlg.server_threads_per_server
 
             # 同步到 config 模块
-            config.MERGE_MAX_CHARS = dlg.merge_max_chars
             config.CIRCUIT_BREAKER_THRESHOLD = dlg.circuit_breaker_threshold
 
             self._save_current_settings()
@@ -923,7 +903,6 @@ class TTSApp(QWidget):
                 f"每服务器并发数: {dlg.server_threads_per_server}, "
                 f"最大重试: {dlg.max_retries}, "
                 f"熔断阈值: {dlg.circuit_breaker_threshold}, "
-                f"合并字数上限: {dlg.merge_max_chars}, "
                 f"后台合并: {'开' if dlg.background_merge else '关'}, "
                 f"WxPusher: {'已配置' if dlg.wxpusher_app_token and dlg.wxpusher_uid else '未配置'}"
             )
@@ -933,7 +912,6 @@ class TTSApp(QWidget):
         self.lbl_retry_summary.setText(f"最大重试: {self._settings.get('max_retries', 5)}")
         _cb_val = self._settings.get('circuit_breaker_threshold', 6)
         self.lbl_cb_summary.setText(f"熔断阈值: {'已禁用' if _cb_val < 0 else _cb_val}")
-        self.lbl_merge_summary.setText(f"合并字数: {self._settings.get('merge_max_chars', 30)}")
         self.lbl_threads_summary.setText(f"每服务器并发: {self._settings.get('server_threads_per_server', 1)}")
         bg = self._settings.get("background_merge", False)
         self.lbl_bg_merge_summary.setText(f"后台合并: {'开' if bg else '关'}")
@@ -1260,7 +1238,6 @@ class TTSApp(QWidget):
             self.append_log("> 任务已在运行中，忽略重复启动。")
             return
         line_idx = self._settings.get("line_index", 2)
-        config.MERGE_MAX_CHARS = self._settings.get("merge_max_chars", 30)
         server_configs = self._get_server_configs()
         server_protocols = self._get_server_protocols()
         if not server_configs:
