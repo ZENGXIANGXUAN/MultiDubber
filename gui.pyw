@@ -52,8 +52,8 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QPushButton,
                              QGroupBox, QProgressBar, QStyleFactory, QListWidget,
                              QListWidgetItem, QAbstractItemView, QSystemTrayIcon, QMenu,
                              QDialog, QFormLayout, QDialogButtonBox, QSpinBox, QMessageBox,
-                             QCheckBox)
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QObject, QTimer
+                             QCheckBox, QListView)
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QObject, QTimer, QSize
 from PyQt6.QtGui import QPalette, QColor, QIcon, QPixmap, QPainter, QBrush, QCursor
 import config
 from main import process_srt_files
@@ -63,6 +63,16 @@ from logger import init_logger, set_gui_callback, log as file_log, get_log_path
 
 # ── 本地设置持久化 ──────────────────────────────────────────
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_settings.json")
+
+# 列表行高与可见行数。
+# item 的 sizeHint 不能直接取 entry.sizeHint()：ServerEntryWidget 里那条长 URL
+# 会把宽度撑到 800+，QListWidget 按这个宽度排布 item 后内容超出视口，于是出现
+# 水平滚动条；水平滚动条吃掉约 14px 高度，又把竖直滚动条挤出来，而 itemWidget
+# 仍旧按 800+ 的宽度摆放——右侧那个 ✕ 按钮就正好落在竖直滚动条下面。
+# 这里固定行高，宽度交给 view 决定（QSize 的宽传 0）。
+LIST_ROW_HEIGHT = 26
+LIST_MIN_VISIBLE_ROWS = 4
+LIST_MAX_VISIBLE_ROWS = 6
 
 DEFAULT_SETTINGS = {
     "srt_paths": [],
@@ -516,6 +526,8 @@ class ServerEntryWidget(QWidget):
 
         self.url_label = QLabel(url)
         self.url_label.setStyleSheet("color: #ccc; font-size: 12px;")
+        # 条目宽度现在跟随视口，长地址会被裁掉，用 tooltip 补全。
+        self.url_label.setToolTip(url)
 
         self.remove_btn = QPushButton("✕")
         self.remove_btn.setFixedSize(22, 22)
@@ -596,6 +608,7 @@ class FolderEntryWidget(QWidget):
 
         self.path_label = QLabel(path)
         self.path_label.setStyleSheet("color: #ccc; font-size: 12px;")
+        self.path_label.setToolTip(path)
 
         self.remove_btn = QPushButton("✕")
         self.remove_btn.setFixedSize(22, 22)
@@ -711,7 +724,9 @@ class TTSApp(QWidget):
         path_label.setFixedWidth(90)
 
         self.folder_list = QListWidget()
-        self.folder_list.setFixedHeight(110)
+        self.folder_list.setFixedHeight(LIST_MIN_VISIBLE_ROWS * LIST_ROW_HEIGHT + 6)
+        # item 宽度跟随视口：否则窗口变窄时条目仍按旧宽度排布，右侧按钮会被裁掉。
+        self.folder_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.folder_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.folder_list.setStyleSheet(
             "QListWidget { background: #1e1e1e; border: 1px solid #444; border-radius: 4px; }"
@@ -805,7 +820,9 @@ class TTSApp(QWidget):
         server_layout.addLayout(add_row)
 
         self.server_list = QListWidget()
-        self.server_list.setFixedHeight(110)
+        self.server_list.setFixedHeight(LIST_MIN_VISIBLE_ROWS * LIST_ROW_HEIGHT + 6)
+        # 同 folder_list：item 宽度必须跟随视口。
+        self.server_list.setResizeMode(QListView.ResizeMode.Adjust)
         self.server_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.server_list.setStyleSheet(
             "QListWidget { background: #1e1e1e; border: 1px solid #444; border-radius: 4px; }"
@@ -959,6 +976,17 @@ class TTSApp(QWidget):
         except ValueError:
             pass
 
+    def _autosize_list(self, list_widget: QListWidget):
+        """
+        按条目数调整列表高度：4 行以内不出现滚动条，超过 6 行才滚动。
+
+        原先两个列表都是固定 110px，滚动条一旦被长 URL 逼出来就再也不会消失，
+        删掉几条之后它仍然竖在那里，看起来就像“滑块没跟着删除、位置还偏了”。
+        高度改为跟随行数后，6 条以内根本没有滚动条可看。
+        """
+        rows = max(LIST_MIN_VISIBLE_ROWS, min(list_widget.count(), LIST_MAX_VISIBLE_ROWS))
+        list_widget.setFixedHeight(rows * LIST_ROW_HEIGHT + 6)
+
     def _add_server_row(self, url: str, protocol: str = "detecting"):
         if url in self._server_widgets:
             return
@@ -966,10 +994,12 @@ class TTSApp(QWidget):
         entry = ServerEntryWidget(url, item, protocol=protocol, parent=self)
         entry.remove_signal.connect(self._remove_server_item)
         entry.retry_signal.connect(self._retry_server_connection)
-        item.setSizeHint(entry.sizeHint())
+        # 宽度传 0：item 宽度交给 view 按视口决定，否则长 URL 会把 item 撑宽。
+        item.setSizeHint(QSize(0, LIST_ROW_HEIGHT))
         self.server_list.addItem(item)
         self.server_list.setItemWidget(item, entry)
         self._server_widgets[url] = (item, entry)
+        self._autosize_list(self.server_list)
 
     def _update_thread_hints(self):
         pass  # 并发数现在由设置窗口统一管理
@@ -1110,7 +1140,15 @@ class TTSApp(QWidget):
         widget = self.server_list.itemWidget(item)
         url = widget.url if widget else None
         row = self.server_list.row(item)
+        # takeItem() 只移除数据项，setItemWidget() 设置的控件会变成 viewport
+        # 的孤儿，继续停在原来的位置上压住新行；滚动条按新的条目数计算，
+        # 视觉上就表现为“删了几台之后滑块位置不对、盖住了删除按钮”。
+        # 必须先显式摘除控件：removeItemWidget 内部走 setIndexWidget(index, None)，
+        # 是 deleteLater，在按钮自己的 clicked 槽里调用也不会悬空。
+        if widget is not None:
+            self.server_list.removeItemWidget(item)
         self.server_list.takeItem(row)
+        self._autosize_list(self.server_list)
         if url and url in self._server_widgets:
             del self._server_widgets[url]
         if url:
@@ -1129,16 +1167,23 @@ class TTSApp(QWidget):
         item = QListWidgetItem(self.folder_list)
         entry = FolderEntryWidget(path, item, self)
         entry.remove_signal.connect(self._remove_folder_item)
-        item.setSizeHint(entry.sizeHint())
+        # 同 _add_server_row：宽度交给视口。
+        item.setSizeHint(QSize(0, LIST_ROW_HEIGHT))
         self.folder_list.addItem(item)
         self.folder_list.setItemWidget(item, entry)
         self._folder_widgets[path] = (item, entry)
+        self._autosize_list(self.folder_list)
 
     def _remove_folder_item(self, item: QListWidgetItem):
         widget = self.folder_list.itemWidget(item)
         path = widget.path if widget else None
         row = self.folder_list.row(item)
+        # 同 _remove_server_item：不摘掉 itemWidget 就会留下一个悬在原位的
+        # 孤立控件，删行后看起来像删错了行。
+        if widget is not None:
+            self.folder_list.removeItemWidget(item)
         self.folder_list.takeItem(row)
+        self._autosize_list(self.folder_list)
         if path and path in self._folder_widgets:
             del self._folder_widgets[path]
         self._save_current_settings()
