@@ -67,8 +67,10 @@ status_lock = threading.Lock()
 ABORT_ALL = False
 STOP_REASON = None  # None | "USER_ABORT" | "ALL_SERVERS_DOWN" | "RESTART_REQUESTED"
 
-# === 字幕合并配置 ===
-MERGE_MAX_CHARS = 30  # 合并后文本最大字符数，0 表示禁用合并
+# === 字幕合并配置（已废弃）===
+# 字幕不再合并：一条字幕 = 一个时间槽 = 一次 TTS 请求。
+# 保留该字段只为兼容旧版 GUI 设置的读写，主流程不再使用。
+MERGE_MAX_CHARS = 30
 
 # === 本地缓存配置 ===
 # 启用本地缓存以优化云存储（如 Google Drive）的处理性能

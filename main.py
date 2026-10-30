@@ -27,15 +27,21 @@ from config import (
     TRANSFORMERS_LINE, USE_TQDM_PROGRESS_BAR, model_lock, status_lock
 )
 from logger import log as logger_log
-from utils import load_status, save_status, clear_status, time_str_to_seconds, is_valid_audio_segment
-from subtitle_parser import parse_subtitles, merge_contiguous_subtitles
+from utils import (
+    load_status, save_status, clear_status, time_str_to_seconds,
+    is_valid_audio_segment, compute_layout_signature, status_is_layout_compatible
+)
+from subtitle_parser import parse_subtitles
 from subtitle_preprocessor import preprocess_srt_content, preprocess_text
 from audio_processor import (
     extract_single_audio, merge_single_audio_video, crop_audio,
-    adjust_duration_with_rubberband, merge_audio
+    adjust_duration_with_rubberband, merge_audio, inspect_audio_segments
 )
 from model import DurationPredictor
-from dispatcher import MultiServerDispatcher, reset_circuit_breaker_states  # 多服务器分发器与熔断重置
+from dispatcher import (
+    MultiServerDispatcher, reset_circuit_breaker_states,
+    discard_private_audio, materialize_private_audio,
+)  # 多服务器分发器与熔断重置
 from local_cache_manager import LocalCacheManager, is_cloud_path
 
 # Initialize global duration predictor
@@ -71,11 +77,22 @@ class ProgressCallback:
 # === 字幕文本预处理 ===
 def post_process_audio_task(index: int, raw_generated_path: str, applied_speed: float, text: str,
                             target_duration_s: float, current_tmp_dir: str):
+    """
+    把单段 TTS 产物对齐到字幕时间槽，写出 output_{index}.wav。
+
+    约定：只有调度器私有化目录（MultTTS_raw）下的文件才允许删除。
+    历史实现直接删 gradio_client 的下载路径，而那条路径是全局共享、
+    按内容 sha256 去重的——同一路径被两个任务持有时，先跑完的任务会
+    把另一个任务的文件删掉。
+    """
     output_path_for_merge = os.path.join(current_tmp_dir, f"output_{index}.wav")
 
-    if not raw_generated_path or not os.path.exists(raw_generated_path):
-        logger_log("POST", f"!! [Task {index}] API生成失败，创建静音占位符。")
+    def _write_silence_placeholder(reason: str):
+        logger_log("POST", f"!! [Task {index}] {reason}，创建静音占位符（{target_duration_s:.2f}s）。")
         AudioSegment.silent(duration=target_duration_s * 1000).export(output_path_for_merge, format="wav")
+
+    if not raw_generated_path or not os.path.exists(raw_generated_path):
+        _write_silence_placeholder("API 未返回可用音频")
         return index
     # 校验文件大小：0 字节或极小文件视为下载/传输失败
     try:
@@ -83,12 +100,8 @@ def post_process_audio_task(index: int, raw_generated_path: str, applied_speed: 
     except OSError:
         file_size = 0
     if file_size < 100:
-        logger_log("POST", f"!! [Task {index}] 生成音频文件无效 (size={file_size}B)，创建静音占位符。")
-        AudioSegment.silent(duration=target_duration_s * 1000).export(output_path_for_merge, format="wav")
-        try:
-            os.remove(raw_generated_path)
-        except OSError:
-            pass
+        _write_silence_placeholder(f"生成音频文件无效 (size={file_size}B)")
+        discard_private_audio(raw_generated_path)
         return index
     try:
         actual_raw_duration_s = 0
@@ -96,18 +109,19 @@ def post_process_audio_task(index: int, raw_generated_path: str, applied_speed: 
             audio = AudioSegment.from_file(raw_generated_path)
             actual_raw_duration_s = (len(audio) / 1000.0) * applied_speed
         except Exception as e:
-            logger_log("POST", f"!! [Task {index}] 无法解码生成音频 (文件可能已损坏)，创建静音占位符: {e}")
-            AudioSegment.silent(duration=target_duration_s * 1000).export(output_path_for_merge, format="wav")
-            try:
-                os.remove(raw_generated_path)
-            except OSError:
-                pass
+            _write_silence_placeholder(f"无法解码生成音频（文件可能已损坏）: {e}")
+            discard_private_audio(raw_generated_path)
             return index
-        adjust_duration_with_rubberband(raw_generated_path, output_path_for_merge, target_duration_s)
-        try:
-            os.remove(raw_generated_path)
-        except OSError:
-            pass
+
+        adjusted_ok = adjust_duration_with_rubberband(
+            raw_generated_path, output_path_for_merge, target_duration_s
+        )
+        if not adjusted_ok:
+            logger_log(
+                "POST",
+                f"!! [Task {index}] 时长调节降级（已强制对齐到 {target_duration_s:.2f}s，音质不保证）",
+            )
+        discard_private_audio(raw_generated_path)
         if actual_raw_duration_s > 0:
             with model_lock:
                 duration_predictor.add_data_point_and_retrain(text, actual_raw_duration_s)
@@ -138,6 +152,12 @@ def tts_generation_task(index: int, subtitle: List, main_reference_audio: Union[
     _export_reference_clip(reference_clip, ref_clip_path)
 
     raw_generated_path = generate_audio_api(ref_clip_path, text, applied_speed)
+    # 单机模式同样私有化：gradio_client 的下载路径按内容 sha256 共享，
+    # 混用会导致清理时误删别的任务正在用的文件。
+    if raw_generated_path:
+        private_path = materialize_private_audio(raw_generated_path, index)
+        if private_path:
+            raw_generated_path = private_path
     return raw_generated_path, applied_speed, text, target_duration_s
 
 
@@ -193,6 +213,35 @@ def _prepare_tts_params(index: int, subtitle: List, main_reference_audio: Union[
         "speed": applied_speed,
         "target_duration_s": target_duration_s,
     }
+
+
+def _purge_segment_files(current_tmp_dir: str, log) -> int:
+    """
+    清空 tmp 下的片段产物（output_*.wav 与 ref_clips）。
+
+    仅用于“字幕布局已变、旧 index 语义失效”的场景：这些文件必须物理删除，
+    否则 _count_existing_segments / 扫描恢复会把它们当成有效片段重新复用。
+    """
+    removed = 0
+    try:
+        for name in os.listdir(current_tmp_dir):
+            if not (name.startswith("output_") and name.endswith(".wav")):
+                continue
+            try:
+                os.remove(os.path.join(current_tmp_dir, name))
+                removed += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+    ref_dir = os.path.join(current_tmp_dir, "ref_clips")
+    if os.path.isdir(ref_dir):
+        try:
+            shutil.rmtree(ref_dir)
+        except OSError:
+            pass
+    return removed
 
 
 def _find_video_path(base_name_no_ext, srt_path):
@@ -481,6 +530,46 @@ def _finalize_audio_video_job(subtitle_name: str,
             return False
 
         log(f"--- [{subtitle_name}] 字幕片段后台合并中... ---")
+
+        # 合并前做一次片段体检：时长与字幕时间槽不符、文件缺失、纯静音都要留痕。
+        # 这段校验早就写好了（audio_processor.inspect_audio_segments），但一直没接进流程，
+        # 导致“片段只有一半长度、后半段被补零”这种情况在日志里完全看不出来。
+        try:
+            segment_issues = inspect_audio_segments(parsed_subtitles, current_tmp_dir)
+        except Exception as e:
+            segment_issues = []
+            log(f"!! [{subtitle_name}] 片段体检失败（不影响合并）: {e}")
+        if segment_issues:
+            by_type = {}
+            for issue in segment_issues:
+                by_type.setdefault(issue.get("type"), []).append(issue)
+            summary = ", ".join(f"{k}={len(v)}" for k, v in sorted(by_type.items()))
+            log(f"!! [{subtitle_name}] 片段体检发现 {len(segment_issues)} 处异常（{summary}）")
+            for issue in segment_issues[:10]:
+                if issue.get("type") == "duration_mismatch":
+                    log(
+                        f"   - #{issue['index']} 时长 {issue['actual_ms'] / 1000:.2f}s / "
+                        f"目标 {issue['target_ms'] / 1000:.2f}s "
+                        f"(差 {issue['delta_ms'] / 1000:+.2f}s)"
+                    )
+                else:
+                    log(f"   - #{issue['index']} {issue['type']}")
+            if len(segment_issues) > 10:
+                log(f"   ... 其余 {len(segment_issues) - 10} 条见上表规律")
+
+        # 时长对得上、但整段是静音的片段，inspect_audio_segments 抓不到（它只比时长）。
+        # 静音占位必须单独统计，否则“这段没人说话”永远查不到来源。
+        silent_indices = [
+            i for i in range(len(parsed_subtitles))
+            if not is_valid_audio_segment(os.path.join(current_tmp_dir, f"output_{i}.wav"))
+        ]
+        if silent_indices:
+            log(
+                f"!! [{subtitle_name}] 有 {len(silent_indices)} 个片段是纯静音/无效，"
+                f"成品中对应位置将无人声：{silent_indices[:20]}"
+                f"{' ...' if len(silent_indices) > 20 else ''}"
+            )
+
         merged_audio = merge_audio(parsed_subtitles, current_tmp_dir)
         merged_audio.export(output_audio_file, format="wav")
         log(f"[{subtitle_name}] 输出临时配音 WAV: {os.path.basename(output_audio_file)}")
@@ -928,12 +1017,13 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                 global_file_idx += 1
                 continue
 
-            # 合并连续字幕，减少 API 调用次数
-            original_count = len(parsed_subtitles)
-            parsed_subtitles = merge_contiguous_subtitles(parsed_subtitles, config.MERGE_MAX_CHARS)
-            merged_count = len(parsed_subtitles)
-            if merged_count < original_count:
-                log(f"  字幕合并: {original_count} 条 → {merged_count} 条")
+            # 字幕不再合并：一条字幕 = 一个时间槽 = 一次 TTS 请求。
+            # 旧版按 MERGE_MAX_CHARS 把相邻短句拼成长句，本意是减少 API 调用、
+            # 降低 GPU 压力；代价是内部 index 与用户看到的 SRT 编号完全脱节
+            # （本次 1098 条被并成 607 条），片段一旦错位，日志里的 Task N
+            # 无法对应到具体字幕，且单次错位会连带影响整段合并文本。
+            log(f"  字幕条目: {len(parsed_subtitles)} 条（未合并，一条一请求）")
+            layout_sig = compute_layout_signature(parsed_subtitles)
 
             # ── 2. 字幕检查通过后，查找视频并提取参考音频 ──
             main_audio_path = os.path.join(ref_audio_path, subtitle_name + ".wav")
@@ -993,9 +1083,20 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
 
             task_completed_successfully = False
             finalize_submitted = False
+            unvoiceable_indices = []  # 无法准备配音参数、只能写静音占位的条目
 
             try:
-                completed_indices = load_status(local_status_file, srt_file)
+                # 字幕布局变了（取消合并、SRT 重新断句、条数增减）时，旧的
+                # output_*.wav 与新的 index 语义完全不对应。必须先物理清空，
+                # 否则下面“扫描已存在片段并恢复”的逻辑会把旧片段重新捡回来，
+                # 让作废状态变成一次无声的空转。
+                if not status_is_layout_compatible(local_status_file, srt_file, layout_sig):
+                    purged_files = _purge_segment_files(current_tmp_dir, log)
+                    if purged_files:
+                        log(f"  -> [恢复系统] 字幕布局已变化，清空 {purged_files} 个旧片段，全部重新生成")
+                    clear_status(local_status_file)
+
+                completed_indices = load_status(local_status_file, srt_file, layout_sig)
                 all_indices = list(range(len(parsed_subtitles)))
 
                 # 校验从 status.json 加载的已完成索引：若对应文件不存在或全静音，则剔除
@@ -1036,7 +1137,7 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                     log(f"  -> [恢复系统] 扫描到 {recovered_count} 个已存在有效片段 | "
                         f"进度: {done_count}/{total_tasks_for_log} ({done_count * 100 // total_tasks_for_log}%) | "
                         f"剩余: {remaining} 个")
-                    save_status(local_status_file, srt_file, completed_indices)
+                    save_status(local_status_file, srt_file, completed_indices, layout_sig)
 
                 uncompleted_indices = [idx for idx in all_indices if idx not in completed_indices]
                 total_tasks = len(all_indices)
@@ -1066,6 +1167,13 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                                 return
                             params = task_params_map.get(idx)
                             if params is None:
+                                # 走到这里说明任务参数在入队后被弄丢了。不能静默 return：
+                                # 那样既不产片段、也不进 completed，最终被 merge_audio 补静音。
+                                logger_log(
+                                    "POST",
+                                    f"!! [Task {idx}] 找不到任务参数，跳过（该条不会生成配音，"
+                                    f"合并时会补静音）",
+                                )
                                 return
                             # 运行中新增的节点不在启动快照里，协议必须实时向池查询。
                             proto = dispatcher.get_protocol(server_url) if dispatcher else "voxcpm2"
@@ -1079,7 +1187,7 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                             )
                             with status_lock:
                                 completed_indices.add(idx)
-                                save_status(local_status_file, srt_file, completed_indices)
+                                save_status(local_status_file, srt_file, completed_indices, layout_sig)
 
                         # ── CPU Worker 注入：进度日志 ──
                         def done_callback(idx, server_url):
@@ -1132,8 +1240,25 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                                         last_valid_ref_path=last_valid_ref_path
                                     )
                                     if params is None:
+                                        # 不能只把 index 标记完成就 continue：那样
+                                        # output_{index}.wav 根本不存在，merge_audio
+                                        # 会静默补一段静音，成品看着完全正常。
+                                        # 这里写一个时长正确的显式占位，并登记失败，
+                                        # 让文件级结果如实报告。
+                                        _s, _e, _raw, _ = parsed_subtitles[index]
+                                        _dur_s = max(0.05, time_str_to_seconds(_e) - time_str_to_seconds(_s))
+                                        AudioSegment.silent(duration=_dur_s * 1000).export(
+                                            os.path.join(current_tmp_dir, f"output_{index}.wav"),
+                                            format="wav",
+                                        )
                                         with status_lock:
                                             completed_indices.add(index)
+                                            save_status(local_status_file, srt_file,
+                                                        completed_indices, layout_sig)
+                                        unvoiceable_indices.append(index)
+                                        log(f"  !! [Task {index}] 无法准备配音参数"
+                                            f"（文本为空或参考音频过短且无可复用历史），"
+                                            f"写入 {_dur_s:.2f}s 静音占位")
                                         continue
 
                                     last_valid_ref_path = params["ref_audio_path"]
@@ -1199,7 +1324,7 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                                             post_result = post_process_audio_task(idx, *gen_result, current_tmp_dir)
                                             with status_lock:
                                                 completed_indices.add(post_result)
-                                                save_status(local_status_file, srt_file, completed_indices)
+                                                save_status(local_status_file, srt_file, completed_indices, layout_sig)
                                                 completed_count += 1
                                                 session_processed_count += 1
                                                 elapsed_time = time.time() - file_start_time
@@ -1268,6 +1393,14 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                     if not ok:
                         log(f"!! [{subtitle_name}] 同步合并失败")
                         processing_failures.append((subtitle_name, "同步合并或云端结果同步失败"))
+
+                if unvoiceable_indices:
+                    processing_failures.append((
+                        subtitle_name,
+                        f"{len(unvoiceable_indices)} 条字幕无法配音（文本为空或参考音频过短），"
+                        f"已用静音占位：{unvoiceable_indices[:20]}"
+                        f"{' ...' if len(unvoiceable_indices) > 20 else ''}",
+                    ))
 
                 global_file_idx += 1
 

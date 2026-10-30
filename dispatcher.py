@@ -17,8 +17,12 @@ import os
 import socket
 import ssl
 import queue
+import shutil
+import hashlib
+import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterable, List, Callable, Optional, Tuple
 from gradio_client import Client
@@ -53,6 +57,135 @@ CONNECT_SPACING_S     = 0.3    # 同一时刻只允许一个 worker 开始握手
 
 # 运行时服务器池开关：关闭后 add/remove 不生效，行为回到“下次流程启动才更新”。
 LIVE_POOL_ENABLED = True
+
+# ──────────────────────────────────────────────
+# 产物私有化：把 gradio_client 的下载结果复制成本任务独占的文件
+# ──────────────────────────────────────────────
+# gradio_client 2.x 的下载目录是全局共享的（默认 %TEMP%/gradio），且按
+# 内容 sha256 分目录：dest = <output_dir>/<sha256(content)>/<filename>。
+# 也就是说“内容相同的两次返回”必然映射到同一个本地路径，而本项目过去把它
+# 当成本任务私有文件、在后处理结束时 os.remove —— 同一路径被两个任务持有
+# 时，先跑完的那个会把文件删掉，另一个只能读到空文件（静音占位）或读到
+# 对方的内容（整句串台）。这里统一复制到任务独占路径，从根本上断开共享。
+RAW_STAGE_DIR = os.path.join(tempfile.gettempdir(), "MultTTS_raw")
+
+
+def is_owned_raw_path(path: Optional[str]) -> bool:
+    """判断路径是否为调度器私有化后的产物（只有这种路径才允许后处理删除）。"""
+    if not path:
+        return False
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(RAW_STAGE_DIR)]) == os.path.abspath(RAW_STAGE_DIR)
+    except (ValueError, OSError):
+        return False
+
+
+def materialize_private_audio(raw_path: str, task_id) -> Optional[str]:
+    """
+    把返回音频复制到本任务独占路径。失败返回 None（交给重试）。
+
+    复制而不是移动：源文件可能仍被其他任务的下载流程引用；移动会破坏它们。
+    """
+    try:
+        os.makedirs(RAW_STAGE_DIR, exist_ok=True)
+        ext = os.path.splitext(raw_path)[1] or ".wav"
+        dest = os.path.join(RAW_STAGE_DIR, f"raw_{task_id}_{uuid.uuid4().hex[:8]}{ext}")
+        shutil.copy2(raw_path, dest)
+        return dest
+    except Exception as e:
+        _log("RAW", f"Task {task_id} 产物私有化失败，放弃本次返回: {e}")
+        return None
+
+
+def discard_private_audio(path: Optional[str]) -> None:
+    """只删除私有化目录下的文件；外部路径一律不碰。"""
+    if not is_owned_raw_path(path):
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def cleanup_stale_raw_files(max_age_s: float = 6 * 3600) -> None:
+    """清理崩溃/强杀残留的私有产物，避免 %TEMP% 无限膨胀。"""
+    if not os.path.isdir(RAW_STAGE_DIR):
+        return
+    cutoff = time.time() - max_age_s
+    removed = 0
+    try:
+        for name in os.listdir(RAW_STAGE_DIR):
+            if not (name.startswith("raw_") and name.endswith(".wav")):
+                continue
+            path = os.path.join(RAW_STAGE_DIR, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                continue
+    except OSError:
+        return
+    if removed:
+        _log("RAW", f"清理残留私有产物 {removed} 个（>{max_age_s / 3600:.0f}h）")
+
+
+class _ProductRegistry:
+    """
+    同一批任务内对“返回音频内容”做指纹登记，用于发现多节点并发串台。
+
+    判定规则：
+      - 内容完全相同 + 文本相同  → 合法（SRT 里本来就有重复台词），允许复用
+      - 内容完全相同 + 文本不同  → 服务端把 A 的产物给了 B，必须重试
+
+    这正是本次事故的形态：index 4（“完整拆解夺冠策略…”）与 index 7
+    （“而是等它开始往一侧逼仓…”）拿到了字节完全相同的音频。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._by_digest = {}    # digest -> (task_id, text)
+        self._task_digest = {}  # task_id -> digest
+
+    def reset(self) -> None:
+        with self._lock:
+            self._by_digest.clear()
+            self._task_digest.clear()
+
+    @staticmethod
+    def _digest(path: str) -> str:
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 256), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def check(self, task_id, text: str, path: str) -> Tuple[bool, Optional[int]]:
+        """返回 (是否与别的任务串台, 对方 task_id)。本任务的旧登记会被新指纹覆盖。"""
+        # 极短文本（语气词、单词应答）本来就容易生成几乎相同的气口，
+        # 判重收益低而误伤概率高，直接放行。
+        if len((text or "").strip()) < 4:
+            return False, None
+        try:
+            digest = self._digest(path)
+        except OSError:
+            return False, None
+        with self._lock:
+            previous = self._task_digest.get(task_id)
+            if previous and previous != digest and self._by_digest.get(previous, (None,))[0] == task_id:
+                self._by_digest.pop(previous, None)
+
+            owner = self._by_digest.get(digest)
+            if owner is not None and owner[0] != task_id and owner[1] != text:
+                return True, owner[0]
+
+            self._by_digest[digest] = (task_id, text)
+            self._task_digest[task_id] = digest
+            return False, None
+
+
+_PRODUCT_REGISTRY = _ProductRegistry()
+
 
 # ──────────────────────────────────────────────
 # 服务器连接缓存 (线程独立存储，避免并发冲突)
@@ -380,7 +513,24 @@ def _call_api_on_server(url: str, ref_audio_path: str,
         path = _extract_audio_path(result)
         is_valid, err_msg = _validate_returned_audio(path)
         if is_valid:
-            return path, _FAIL_NONE
+            # 1) 先私有化：后续所有后处理只操作这份独占副本。
+            private_path = materialize_private_audio(path, task_id)
+            if not private_path:
+                _log("API_ERR", f"{label} ({proto_name}) | 返回音频无法私有化，计入配音重试。")
+                return None, _FAIL_API
+
+            # 2) 再做内容指纹校验：内容与另一个任务相同但文本不同 = 服务端串台。
+            duplicated, owner_task = _PRODUCT_REGISTRY.check(task_id, gen_text, private_path)
+            if duplicated:
+                _log(
+                    "DUP",
+                    f"{label} | Task {task_id} 返回的音频与 Task {owner_task} 字节完全相同，"
+                    f"但文本不同，判定为并发串台，丢弃并重新入队。",
+                )
+                discard_private_audio(private_path)
+                return None, _FAIL_API
+
+            return private_path, _FAIL_NONE
 
         _log("API_ERR", f"{label} ({proto_name}) | 云端返回音频无效 ({err_msg})，计入配音重试。")
         return None, _FAIL_API
@@ -836,6 +986,10 @@ class MultiServerDispatcher:
             self._all_done_event.clear()  # 清除上一个文件的完成事件信号
             self._total_submitted = float('inf')
             self._pause_logged = False
+
+        # 每个文件开始新一批任务时，清空产物指纹表，避免跨文件误判。
+        _PRODUCT_REGISTRY.reset()
+        cleanup_stale_raw_files()
 
         def _abort_requested() -> bool:
             return abort_flag_fn() or self._abort_event.is_set() or self._shutdown

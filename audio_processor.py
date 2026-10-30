@@ -255,7 +255,19 @@ def crop_audio(start_time_str: str, end_time_str: str, input_file_or_audio: Unio
         return None
 
 
-def adjust_duration_with_rubberband(input_path: str, output_path: str, target_duration_s: float):
+def adjust_duration_with_rubberband(input_path: str, output_path: str, target_duration_s: float) -> bool:
+    """
+    把 input_path 的时长精确对齐到 target_duration_s，写入 output_path。
+
+    返回 True 表示按预期完成（含无需调整的直通）；False 表示变速失败、走了
+    兜底路径——此时仍会保证输出时长等于目标时长，但音质不保证。
+
+    关键约束：无论成功失败，输出文件的时长都必须等于目标时长。
+    历史实现在异常分支里直接 shutil.copy(input_path, output_path)，把未调节
+    时长的原始音频原样落盘，再由 merge_audio 静默补零，最终表现为“这段没人
+    说话”；同时失败只走 _safe_print（stdout），GUI 模式下日志里看不到任何痕迹。
+    """
+    target_ms = int(round(max(0.0, target_duration_s) * 1000))
     try:
         y, sr = sf.read(input_path)
         target_samples = _target_samples(target_duration_s, sr)
@@ -264,20 +276,22 @@ def adjust_duration_with_rubberband(input_path: str, output_path: str, target_du
         if current_duration_s < 0.01:
             shape = (target_samples, y.shape[1]) if y.ndim > 1 else (target_samples,)
             sf.write(output_path, np.zeros(shape, dtype=y.dtype), sr)
-            return
+            return True
         rate = current_duration_s / target_duration_s
         if abs(rate - 1.0) < 0.001:
             sf.write(output_path, _fit_array_to_samples(y, target_samples), sr)
-            return
+            return True
         if not USE_TQDM_PROGRESS_BAR:
             _safe_print(f"    -> 需调节时长：从 {current_duration_s:.2f}s 到 {target_duration_s:.2f}s (原始速率: {rate:.2f}x)")
         if rate < MIN_RUBBERBAND_RATE:
-            if not USE_TQDM_PROGRESS_BAR:
-                _safe_print(
-                    f"    -> 警告: 速率 {rate:.2f}x 低于下限 {MIN_RUBBERBAND_RATE}x。将以 {MIN_RUBBERBAND_RATE}x 速度拉伸并补充静音。")
+            logger_log(
+                "AUDIO",
+                f"    -> 速率 {rate:.2f}x 低于下限 {MIN_RUBBERBAND_RATE}x，"
+                f"以 {MIN_RUBBERBAND_RATE}x 拉伸后补静音"
+                f"（{current_duration_s:.2f}s / 目标 {target_duration_s:.2f}s）",
+            )
 
             # rb.time_stretch 在后台调用 rubberband.exe
-            # 由于我们的补丁，这里再也不会弹窗了！
             stretched_y = rb.time_stretch(y, sr, MIN_RUBBERBAND_RATE)
 
             stretched_duration_s = len(stretched_y) / sr
@@ -291,9 +305,24 @@ def adjust_duration_with_rubberband(input_path: str, output_path: str, target_du
         else:
             stretched_y = rb.time_stretch(y, sr, rate)
             sf.write(output_path, _fit_array_to_samples(stretched_y, target_samples), sr)
+        return True
     except Exception as e:
-        _safe_print(f"!! 时长调节时发生严重错误: {e}")
-        shutil.copy(input_path, output_path)
+        logger_log(
+            "AUDIO",
+            f"!! 时长调节失败，已改用 pydub 强制对齐到 {target_ms}ms（音质不保证）: "
+            f"{os.path.basename(input_path)} | {e}",
+        )
+        try:
+            segment = AudioSegment.from_file(input_path)
+            _fit_audio_segment(segment, target_ms).export(output_path, format="wav")
+        except Exception as e2:
+            logger_log("AUDIO", f"!! 兜底对齐同样失败，写出静音占位: {os.path.basename(input_path)} | {e2}")
+            try:
+                AudioSegment.silent(duration=target_ms).export(output_path, format="wav")
+            except Exception as e3:
+                logger_log("AUDIO", f"!! 静音占位写入失败: {output_path} | {e3}")
+                return False
+        return False
 
 
 _SF_SAMPLE_WIDTH = {
@@ -344,6 +373,8 @@ def merge_audio(parsed_subtitles: List[List], current_tmp_dir: str) -> AudioSegm
     #    原实现 `merged_audio += segment` 每次重拷已累积音频，复杂度 O(n²)。
     chunks: List[bytes] = []
     cursor_frames = 0
+    short_segments = []   # (index, 目标ms, 实际ms)
+    missing_segments = []  # index
 
     for i, subtitle in enumerate(parsed_subtitles):
         start_ms, end_ms = _subtitle_ms_bounds(subtitle)
@@ -368,12 +399,17 @@ def merge_audio(parsed_subtitles: List[List], current_tmp_dir: str) -> AudioSegm
                 data = audio_segment.raw_data
             except Exception as e:
                 logger_log("MERGE", f"!! 无法读取 {segment_file} ({e})，用静音代替。")
+        else:
+            missing_segments.append(i)
 
         want_frames = int(round(target_duration_ms * frame_rate / 1000.0))
         have_frames = len(data) // frame_bytes
         if have_frames > want_frames:
             data = data[: want_frames * frame_bytes]
         elif have_frames < want_frames:
+            pad_ms = int(round((want_frames - have_frames) * 1000.0 / frame_rate))
+            if pad_ms >= 300:
+                short_segments.append((i, target_duration_ms, int(round(have_frames * 1000.0 / frame_rate))))
             data += b"\x00" * ((want_frames - have_frames) * frame_bytes)
 
         chunks.append(data)
@@ -382,6 +418,24 @@ def merge_audio(parsed_subtitles: List[List], current_tmp_dir: str) -> AudioSegm
         # 每 5 段或最后一段汇报进度
         if (i + 1) % 5 == 0 or i + 1 == total:
             logger_log("MERGE", f"合并进度: {i + 1}/{total} ({(i + 1) * 100 // total}%)")
+
+    # 合并阶段的静音补齐必须可见：历史上这里静默补零，把“片段过短”伪装成
+    # “这段本来没人说话”，成品看起来完全正常。
+    if missing_segments:
+        logger_log(
+            "MERGE",
+            f"!! 有 {len(missing_segments)} 个片段文件缺失，已按目标时长填静音："
+            f"{missing_segments[:20]}{' ...' if len(missing_segments) > 20 else ''}",
+        )
+    if short_segments:
+        preview = ", ".join(
+            f"#{idx} {have/1000:.2f}s/{target/1000:.2f}s" for idx, target, have in short_segments[:10]
+        )
+        logger_log(
+            "MERGE",
+            f"!! 有 {len(short_segments)} 个片段短于字幕时间槽，已补静音（示例：{preview}"
+            f"{' ...' if len(short_segments) > 10 else ''}）",
+        )
 
     merged_audio = AudioSegment(
         data=b"".join(chunks),

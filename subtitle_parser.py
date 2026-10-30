@@ -35,6 +35,11 @@ def merge_contiguous_subtitles(subtitles: list[list[str]], max_chars: int = 30) 
     """
     合并时间戳连续的相邻字幕。
 
+    已废弃（deprecated）：主流程不再调用。合并会让内部 index 与用户可见的
+    SRT 条目编号脱节，片段一旦错位就无法按字幕编号排查；需要减少请求数时
+    请改在服务端做批处理，而不是改变本地索引语义。
+    保留此函数仅为兼容旧脚本/测试。
+
     Args:
         subtitles: 字幕列表，每条格式 [start_time, end_time, text, english_text]
         max_chars: 合并后文本最大字符数，0 表示禁用合并
