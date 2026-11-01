@@ -46,3 +46,6 @@ logs/
 
 # User settings
 app_settings.json
+
+# Agent workspace memory
+.workbuddy/

@@ -6,6 +6,7 @@ local_cache_manager.py — 本地缓存管理器
 """
 
 import os
+import json
 import shutil
 import hashlib
 import time
@@ -13,6 +14,19 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import List, Optional, Tuple
 from logger import log as logger_log
+
+
+# 骨架缓存只搬运字幕类小文件；视频/音频等大文件由 ensure_file() 按需拉取。
+_SKELETON_EXTENSIONS = {".srt", ".txt", ".vtt", ".json"}
+_SKELETON_MAX_SIZE = 10 * 1024 * 1024  # 10 MB
+
+# 这些子目录放的是处理产物（成品、片段、参考音频），不参与骨架同步：
+# 一旦把产物也算进镜像集合，下一次同步会把它们当成“源目录已删除的字幕”隔离掉。
+_SKELETON_SKIP_DIRS = {"中配", "tmp", "REF_AUDIO_PATH", ".orphaned"}
+
+_SKELETON_MARKER = ".skeleton_ready"
+_SKELETON_MANIFEST = ".skeleton_manifest.json"
+_SKELETON_ORPHAN_DIR = ".orphaned"
 
 
 class LocalCacheManager:
@@ -123,13 +137,18 @@ class LocalCacheManager:
                     pass
             raise
 
-    def init_skeleton(self, cloud_path: str) -> str:
+    def init_skeleton(self, cloud_path: str, force: bool = False) -> str:
         """
-        智能骨架复制：只复制 SRT 文件 + 创建目录结构，不复制大文件（视频/音频）。
-        大文件通过 ensure_file() 按需拉取。
+        智能骨架复制：只同步字幕类小文件，视频/音频大文件由 ensure_file() 按需拉取。
+
+        每次调用都会与源目录对账，而不是见到 .skeleton_ready 就直接返回：
+        源目录新增/改过的字幕补进缓存，源目录已删除的字幕移出工作区（.orphaned/）。
+        否则新增视频永远排不进队列，历史残留文件反而会被当成任务处理 ——
+        表现就是“处理的清单和目录里的文件对不上”。
 
         Args:
             cloud_path: 云端文件夹路径
+            force: 不信任缓存内容，所有字幕重新复制一遍
 
         Returns:
             本地缓存路径
@@ -138,81 +157,180 @@ class LocalCacheManager:
             raise FileNotFoundError(f"云端路径不存在: {cloud_path}")
 
         local_path = self._get_local_path(cloud_path)
-        marker_file = os.path.join(local_path, ".skeleton_ready")
+        os.makedirs(local_path, exist_ok=True)
 
-        if os.path.exists(local_path):
-            if os.path.exists(marker_file):
-                logger_log("CACHE", f"骨架缓存已存在: {local_path}")
-                return local_path
-            else:
-                logger_log("CACHE", f"检测到不完整的骨架缓存，清理并重新创建: {local_path}")
-                try:
-                    shutil.rmtree(local_path)
-                except Exception as e:
-                    logger_log("CACHE", f"清理旧缓存失败: {e}")
-
-        logger_log("CACHE", f"正在创建骨架缓存（仅字幕 + 目录结构）...")
-        logger_log("CACHE", f"  源路径: {cloud_path}")
-        logger_log("CACHE", f"  目标路径: {local_path}")
+        manifest_file = os.path.join(local_path, _SKELETON_MANIFEST)
+        marker_file = os.path.join(local_path, _SKELETON_MARKER)
+        is_first_run = not os.path.exists(marker_file)
+        previous = {} if force else self._load_manifest(manifest_file)
 
         t0 = time.time()
-        copy_tasks = []
-        skip_count = 0
+        source_files = self._scan_skeleton_sources(cloud_path)
 
-        # 骨架缓存仅包含字幕文件与目录结构，大文件（源视频、音频等）由 ensure_file() 按需拉取
-        _ALLOWED_EXTENSIONS = {".srt", ".txt", ".vtt", ".json"}
-        _MAX_SUBTITLE_SIZE = 10 * 1024 * 1024  # 10 MB
+        added, updated, failed = [], [], []
+        for rel, (src, size, mtime) in source_files.items():
+            dst = os.path.join(local_path, rel)
+            state = previous.get(rel)
+            existed = os.path.exists(dst)
 
+            if not force:
+                if state:
+                    try:
+                        unchanged = (
+                            int(state.get("size", -1)) == size
+                            and abs(float(state.get("mtime", 0.0)) - mtime) < 1.0
+                            and os.path.getsize(dst) == size
+                        )
+                    except (TypeError, ValueError, OSError):
+                        unchanged = False
+                else:
+                    # 没有清单的老缓存：直接拿文件本身对账，避免升级后首跑全量重抄。
+                    try:
+                        unchanged = (
+                            os.path.getsize(dst) == size
+                            and abs(os.path.getmtime(dst) - mtime) < 1.0
+                        )
+                    except OSError:
+                        unchanged = False
+                if unchanged:
+                    continue
+
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+            except (OSError, shutil.Error) as e:
+                failed.append((rel, str(e)))
+                continue
+            (updated if existed else added).append(rel)
+
+        # 源目录里已经没有、缓存里还留着的字幕：隔离而不是删除。
+        # 空结果时不动手 —— 云盘未挂载/目录刚清空都会走到这里，误判的代价太大。
+        orphans = []
+        if source_files:
+            orphans = self._quarantine_orphans(local_path, source_files)
+        elif not is_first_run:
+            logger_log("CACHE", "源目录未扫描到任何字幕，跳过残留文件隔离（可能云盘未挂载或目录已清空）")
+
+        # 空扫描结果不覆盖清单：云盘掉线时保住上一次的基线，恢复后不会全量重抄。
+        if source_files or is_first_run:
+            self._save_manifest(manifest_file, source_files)
+
+        # 标记文件保留：用于区分“首次创建”和“增量同步”，不再作为短路条件。
         try:
-            for root, dirs, files in os.walk(cloud_path):
-                rel_root = os.path.relpath(root, cloud_path)
-                local_root = os.path.join(local_path, rel_root) if rel_root != "." else local_path
-                os.makedirs(local_root, exist_ok=True)
-
-                for f in files:
-                    ext = os.path.splitext(f)[1].lower()
-                    src = os.path.join(root, f)
-                    dst = os.path.join(local_root, f)
-
-                    if ext in _ALLOWED_EXTENSIONS:
-                        try:
-                            file_size = os.path.getsize(src)
-                        except OSError:
-                            file_size = 0
-
-                        if file_size <= _MAX_SUBTITLE_SIZE:
-                            copy_tasks.append((src, dst))
-                        else:
-                            skip_count += 1
-                    else:
-                        skip_count += 1
-
-            copied_count = len(copy_tasks)
-            if copy_tasks:
-                max_workers = min(16, max(4, len(copy_tasks)))
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    list(executor.map(lambda pair: shutil.copy2(pair[0], pair[1]), copy_tasks))
-
-            # 写入完成标记，避免因中断留下残缺骨架
             with open(marker_file, "w", encoding="utf-8") as mf:
                 mf.write("ready\n")
+        except OSError:
+            pass
 
-            elapsed = time.time() - t0
-            self.stats["copy_to_local_time"] += elapsed
-            self.stats["files_copied"] += copied_count
+        elapsed = time.time() - t0
+        self.stats["copy_to_local_time"] += elapsed
+        self.stats["files_copied"] += len(added) + len(updated)
 
-            logger_log("CACHE", f"骨架创建完成: 字幕/文本文件 {copied_count} 个, "
-                                 f"跳过媒体及其他文件 {skip_count} 个, 耗时 {elapsed:.2f}s")
-            return local_path
+        title = "骨架缓存首次创建" if is_first_run else "骨架缓存已同步"
+        logger_log("CACHE", f"{title}: {local_path}")
+        logger_log("CACHE", f"  源路径: {cloud_path}")
+        logger_log("CACHE", f"  字幕 {len(source_files)} 个 | 新增 {len(added)} | 更新 {len(updated)} "
+                             f"| 隔离残留 {len(orphans)} | 失败 {len(failed)} | 耗时 {elapsed:.2f}s")
+        for rel in added:
+            logger_log("CACHE", f"   + 新增: {rel}")
+        for rel in updated:
+            logger_log("CACHE", f"   ~ 更新: {rel}")
+        for rel in orphans:
+            logger_log("CACHE", f"   - 源目录已无此文件，移入 {_SKELETON_ORPHAN_DIR}/: {rel}")
+        for rel, err in failed[:5]:
+            logger_log("CACHE", f"   !! 复制失败: {rel} ({err})")
 
-        except Exception as e:
-            logger_log("CACHE", f"骨架创建失败: {e}")
-            if os.path.exists(local_path):
+        return local_path
+
+    def _scan_skeleton_sources(self, cloud_path: str) -> dict:
+        """扫描源目录中需要镜像到缓存的小文件：rel_path -> (绝对路径, 大小, mtime)。"""
+        found = {}
+        for root, dirs, files in os.walk(cloud_path):
+            # 剪掉产物目录，避免把缓存里的成品/片段当成源文件再抄一遍。
+            dirs[:] = [
+                d for d in dirs
+                if d not in _SKELETON_SKIP_DIRS and not d.startswith(".")
+            ]
+            for name in files:
+                if name.startswith("."):
+                    continue
+                if os.path.splitext(name)[1].lower() not in _SKELETON_EXTENSIONS:
+                    continue
+                src = os.path.join(root, name)
                 try:
-                    shutil.rmtree(local_path)
-                except:
-                    pass
-            raise
+                    st = os.stat(src)
+                except OSError:
+                    continue
+                if st.st_size > _SKELETON_MAX_SIZE:
+                    continue
+                found[os.path.relpath(src, cloud_path)] = (src, st.st_size, st.st_mtime)
+        return found
+
+    def _quarantine_orphans(self, local_path: str, source_files: dict) -> list:
+        """
+        把缓存根目录里、源目录已经不存在的字幕移到 .orphaned/<时间戳>/。
+
+        只处理根目录：任务清单就从这一层列举，子目录是处理产物不参与。
+        移动而非删除——判断错了用户还能把文件拿回来。
+        """
+        present = {
+            os.path.basename(rel) for rel in source_files
+            if os.path.dirname(rel) == ""
+        }
+        try:
+            names = os.listdir(local_path)
+        except OSError:
+            return []
+
+        moved = []
+        stamp_dir = None
+        for name in names:
+            path = os.path.join(local_path, name)
+            if name.startswith(".") or not os.path.isfile(path):
+                continue
+            if os.path.splitext(name)[1].lower() not in _SKELETON_EXTENSIONS:
+                continue
+            if name in present:
+                continue
+            try:
+                if stamp_dir is None:
+                    stamp_dir = os.path.join(
+                        local_path, _SKELETON_ORPHAN_DIR, time.strftime("%Y%m%d-%H%M%S")
+                    )
+                os.makedirs(stamp_dir, exist_ok=True)
+                target = os.path.join(stamp_dir, name)
+                if os.path.exists(target):
+                    stem, ext = os.path.splitext(name)
+                    idx = 1
+                    while os.path.exists(os.path.join(stamp_dir, f"{stem}.{idx}{ext}")):
+                        idx += 1
+                    target = os.path.join(stamp_dir, f"{stem}.{idx}{ext}")
+                shutil.move(path, target)
+                moved.append(name)
+            except OSError as e:
+                logger_log("CACHE", f"隔离残留文件失败: {name}: {e}")
+        return moved
+
+    def _load_manifest(self, manifest_file: str) -> dict:
+        try:
+            with open(manifest_file, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_manifest(self, manifest_file: str, source_files: dict):
+        payload = {
+            rel: {"size": size, "mtime": mtime}
+            for rel, (_src, size, mtime) in source_files.items()
+        }
+        try:
+            tmp_file = manifest_file + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as fp:
+                json.dump(payload, fp, ensure_ascii=False, indent=1)
+            os.replace(tmp_file, manifest_file)
+        except OSError as e:
+            logger_log("CACHE", f"写入骨架清单失败（不影响本次处理）: {e}")
 
     def ensure_file(self, cloud_base: str, rel_path: str) -> str:
         """

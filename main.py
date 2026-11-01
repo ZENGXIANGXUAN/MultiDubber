@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import shutil
 import hashlib
 import threading
@@ -31,7 +32,7 @@ from utils import (
     load_status, save_status, clear_status, time_str_to_seconds,
     is_valid_audio_segment, compute_layout_signature, status_is_layout_compatible
 )
-from subtitle_parser import parse_subtitles
+from subtitle_parser import parse_subtitles, diagnose_srt_blocks
 from subtitle_preprocessor import preprocess_srt_content, preprocess_text
 from audio_processor import (
     extract_single_audio, merge_single_audio_video, crop_audio,
@@ -158,7 +159,9 @@ def tts_generation_task(index: int, subtitle: List, main_reference_audio: Union[
         private_path = materialize_private_audio(raw_generated_path, index)
         if private_path:
             raw_generated_path = private_path
-    return raw_generated_path, applied_speed, text, target_duration_s
+    # applied_speed 只用于 post_process 里的时长换算。服务端不支持语速，
+    # 返回的音频就是原始时长，所以这里固定 1.0。
+    return raw_generated_path, 1.0, text, target_duration_s
 
 
 def _prepare_tts_params(index: int, subtitle: List, main_reference_audio: Union[str, AudioSegment],
@@ -252,6 +255,99 @@ def _find_video_path(base_name_no_ext, srt_path):
         if os.path.exists(potential_path):
             return potential_path
     return None
+
+
+# ── 完成记录 ────────────────────────────────────────────────
+# 完成状态不能只看 中配/<name>.mp4：成品被搬走或清理后，这一条就会被当成没做过，
+# 整套 GPU 时间重跑一遍。这里在 中配 下留一份“字幕指纹 + 源视频大小”的凭据，
+# 只有字幕内容或源视频真的变了才重新配音；要强制重做，删掉对应条目即可。
+COMPLETION_LEDGER_NAME = "dubbing_ledger.json"
+
+
+def _ledger_path(folder: str) -> str:
+    return os.path.join(folder, "中配", COMPLETION_LEDGER_NAME)
+
+
+def _srt_sha1(srt_abs: str) -> str:
+    try:
+        with open(srt_abs, "rb") as fp:
+            return hashlib.sha1(fp.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _video_size_for(subtitle_name: str, folder: str) -> int:
+    video = _find_video_path(subtitle_name, folder)
+    if not video:
+        return 0
+    try:
+        return os.path.getsize(video)
+    except OSError:
+        return 0
+
+
+def _load_ledger(folder: str) -> dict:
+    try:
+        with open(_ledger_path(folder), "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_ledger(folder: str, data: dict) -> bool:
+    path = _ledger_path(folder)
+    tmp_path = path + ".part"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=1)
+        os.replace(tmp_path, path)
+        return True
+    except OSError:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+def _ledger_matches(entry, srt_abs: str, video_size: int) -> bool:
+    """字幕内容与源视频都没变，才认定“这一条确实做过了”。"""
+    if not isinstance(entry, dict) or not entry:
+        return False
+    sha1 = _srt_sha1(srt_abs)
+    if not sha1 or entry.get("srt_sha1") != sha1:
+        return False
+    recorded_size = entry.get("video_size")
+    if recorded_size and video_size and int(recorded_size) != video_size:
+        return False
+    return True
+
+
+def _record_completion(folder: str, subtitle_name: str, srt_abs: str,
+                       output_name: str, log=None):
+    """登记一次成功产出；字幕与源视频都没变就跳过，避免无谓写盘。"""
+    sha1 = _srt_sha1(srt_abs)
+    if not sha1:
+        return
+    video_size = _video_size_for(subtitle_name, folder)
+    data = _load_ledger(folder)
+    entry = data.get(subtitle_name)
+    if (isinstance(entry, dict)
+            and entry.get("srt_sha1") == sha1
+            and entry.get("video_size") == video_size
+            and entry.get("output") == output_name):
+        return
+    data[subtitle_name] = {
+        "srt_sha1": sha1,
+        "video_size": video_size,
+        "output": output_name,
+        "done_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if not _write_ledger(folder, data) and log:
+        log(f"!! [{subtitle_name}] 完成记录写入失败（不影响本次成品）")
 
 
 def _delete_completed_wav(audio_path, log):
@@ -611,6 +707,15 @@ def _finalize_audio_video_job(subtitle_name: str,
                 cloud_sync_succeeded = False
                 log(f"!! [{subtitle_name}] 同步到源目录失败: {e}（最终视频仍在缓存中）")
 
+        # 成品落地后登记完成记录：以后成品被搬走也不会再重复配音。
+        if task_completed_successfully and cloud_sync_succeeded:
+            _ledger_folder = cloud_source_path or srt_path
+            _record_completion(
+                _ledger_folder, subtitle_name,
+                os.path.join(_ledger_folder, srt_file),
+                f"{subtitle_name}.mp4", log,
+            )
+
         return cloud_sync_succeeded
     except Exception as e:
         log(f"!! [{subtitle_name}] 后台合并错误: {e}")
@@ -762,14 +867,17 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
     all_folder_files: list = []  # [(srt_path, srt_file), ...]
     valid_extensions = {".srt", ".txt"}
     for _srt_path in srt_paths:
+        # 任务清单以源目录为准：骨架缓存只是镜像，可能滞后或残留历史文件。
+        # 用缓存目录列举，会让“源目录里根本没有的文件”变成任务，同时漏掉新增文件。
+        _list_dir = _cloud_base_map.get(_srt_path, _srt_path)
         try:
             files = [
-                f for f in os.listdir(_srt_path)
+                f for f in os.listdir(_list_dir)
                 if os.path.splitext(f)[1].lower() in valid_extensions
                    and not f.endswith("zh.srt") and not f.endswith("en.srt")
             ]
         except FileNotFoundError:
-            log(f"错误: 路径不存在 {_srt_path}")
+            log(f"错误: 路径不存在 {_list_dir}")
             continue
         try:
             files = sorted(files, key=lambda x: int(re.findall(r'\d+', x)[0]))
@@ -785,6 +893,14 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
     total_files = len(all_folder_files)
     if progress_callback:
         progress_callback.set_total_files(total_files)
+
+    # 完成记录按目录缓存，避免每条字幕都读一次盘（云盘上读小文件也要几十毫秒）。
+    _ledger_cache: Dict[str, dict] = {}
+
+    def _ledger_for(folder: str) -> dict:
+        if folder not in _ledger_cache:
+            _ledger_cache[folder] = _load_ledger(folder)
+        return _ledger_cache[folder]
 
     # ── 文件级进度概览 ──
     # 云存储模式下，先从源目录确定完成状态（骨架缓存不复制大文件）
@@ -818,6 +934,13 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                 _scan_tmp = os.path.join(_scan_path, "tmp", hashlib.md5(_scan_name.encode('utf-8')).hexdigest())
                 if _count_existing_segments(_scan_tmp) > 0:
                     _files_partial += 1
+                elif _ledger_matches(
+                    _ledger_for(_check_paths[0]).get(_scan_name),
+                    os.path.join(_check_paths[0], _scan_file),
+                    _video_size_for(_scan_name, _check_paths[0]),
+                ):
+                    # 成品已被搬走，但完成记录还在
+                    _files_done += 1
                 else:
                     _files_new += 1
         log(f"[进度概览] 共 {total_files} 个文件: "
@@ -974,6 +1097,23 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
             _precomputed_tmp_dir = os.path.join(srt_path, "tmp", _precomputed_safe_dir)
             _existing_segment_count = _count_existing_segments(_precomputed_tmp_dir)
 
+            # ── 成品被搬走/清理后的兜底：凭完成记录跳过，避免整套重配 ──
+            # 只在“无视频、无 WAV、无片段”的全新状态下生效，判定条件与
+            # _check_task_skip_or_recover 的第 3/4 级完全一致，不改变原有恢复路径。
+            _srt_abs = os.path.join(_check_srt_path, srt_file)
+            _has_video = os.path.exists(
+                os.path.join(_check_folder_zh, f"{subtitle_name}.mp4")
+            )
+            if (not _has_video
+                    and not os.path.exists(_check_audio)
+                    and _existing_segment_count <= 0):
+                _entry = _ledger_for(_check_srt_path).get(subtitle_name)
+                if _ledger_matches(_entry, _srt_abs, _video_size_for(subtitle_name, _check_srt_path)):
+                    log(f"  -> [完成] 命中完成记录（中配里已无成品，但这条配音过），跳过。")
+                    log(f"     如需重新配音，删除 {_ledger_path(_check_srt_path)} 中的「{subtitle_name}」条目。")
+                    global_file_idx += 1
+                    continue
+
             skip_result = _check_task_skip_or_recover(
                 subtitle_name, srt_file, _check_folder_zh, _check_audio, _check_srt_path, log,
                 existing_segments=_existing_segment_count
@@ -993,6 +1133,12 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                         shutil.rmtree(stale_tmp)
                     except Exception:
                         pass
+                # 成品还在时顺手补登记：等它被搬走，下一次也能凭记录跳过。
+                _record_completion(
+                    _check_srt_path, subtitle_name,
+                    os.path.join(_check_srt_path, srt_file),
+                    f"{subtitle_name}.mp4", log,
+                )
                 global_file_idx += 1
                 continue
 
@@ -1012,8 +1158,9 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
 
             parsed_subtitles = parse_subtitles(file_content, transformers_line)
             if not parsed_subtitles:
-                log(f"无有效字幕，跳过: {srt_file}")
-                processing_failures.append((subtitle_name, "无有效字幕"))
+                reason = diagnose_srt_blocks(file_content)
+                log(f"无有效字幕，跳过: {srt_file} | {reason}")
+                processing_failures.append((subtitle_name, f"无有效字幕: {reason}"))
                 global_file_idx += 1
                 continue
 
@@ -1177,8 +1324,14 @@ def process_srt_files(srt_paths, transformers_line: int = TRANSFORMERS_LINE,
                                 return
                             # 运行中新增的节点不在启动快照里，协议必须实时向池查询。
                             proto = dispatcher.get_protocol(server_url) if dispatcher else "voxcpm2"
-                            # IndexTTS 1.5 服务端按 speed 变速生成；VoxCPM 2.0 无 speed 参数，实际为 1.0
-                            effective_speed = params["speed"] if proto == "indextts_15" else 1.0
+                            # 两个协议都不具备语速能力：
+                            # IndexTTS 1.5 的 /gen_single 没有 speed 参数（param_8 实际是
+                            # temperature），VoxCPM 2.0 同样忽略 speed。服务端按自己的节奏
+                            # 生成，最终时长由 rubberband 后处理对齐。
+                            # 这里必须是 1.0：它参与 actual_raw_duration 的换算，若沿用
+                            # applied_speed，会把"服务端已经变速"的假设写进时长预测器的
+                            # 训练数据，导致越训越偏。
+                            effective_speed = 1.0
                             post_process_audio_task(
                                 idx, raw_path,
                                 effective_speed, params["text"],
